@@ -245,8 +245,9 @@ six cages are genotype-mixed.
   describe the same quantity — pooling every animal instead lets a cage with no
   within-cage contrast move the effect size while leaving the statistic untouched.
   With only five contributing cages the percentile cluster bootstrap is
-  **anti-conservative** (measured 91% coverage at a nominal 95%), and the report
-  says so rather than quietly presenting the interval as exact. A non-significant
+  **anti-conservative** — two independent simulations during review put coverage
+  in the low nineties against a nominal 95% (91% and 93%) — and the report says so
+  rather than quietly presenting the interval as exact. A non-significant
   result is reported as absence of evidence, never as evidence of absence.
 - **Multiplicity.** Benjamini–Hochberg FDR across the ~30-measure scan. The scan
   is labelled hypothesis-generating. A small **pre-specified primary set** is

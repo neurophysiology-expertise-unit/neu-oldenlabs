@@ -13,4 +13,6 @@ cache/
 *.parquet
 *.png
 *.pdf
+report.md
+report.html
 .superpowers/
