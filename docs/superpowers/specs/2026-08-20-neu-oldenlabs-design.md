@@ -230,13 +230,24 @@ six cages are genotype-mixed.
   `10 × 10 × 4 × 2 × 6 = 4800` label assignments (per cage: 58623 C(5,3)=10,
   66336 C(5,3)=10, 58627 C(4,1)=4, 62923 C(2,1)=2, 58597 C(4,2)=6, 58616 C(5,0)=1).
   4800 is fully enumerable, so the test is **exact rather than sampled**.
-  Smallest attainable two-sided p = 2/4800 ≈ 0.0004. This is reported next to
-  every p-value, as `neu-intellicage` does, but here it is a note of adequacy
-  rather than of a resolution floor.
+  Smallest attainable two-sided p = **1/4800 ≈ 0.00021**, not 2/4800: the 2/n
+  floor assumes the fully sign-flipped labelling is itself an enumerated
+  assignment, which holds only when every contributing cage is genotype-balanced.
+  These cages are 3/2, 3/2, 1/3, 1/1 and 2/2, so the mirror is not enumerated and
+  the floor is 1/n. The code reports 2/n only in the balanced case. This value is
+  printed next to every p-value, as `neu-intellicage` does, but here it is a note
+  of adequacy rather than of a resolution floor.
 - **Effect size and interval always**, whatever the p-value: Hedges' g plus a
   cluster bootstrap CI on the stratified difference (resample cages with
-  replacement, then animals within cage). A non-significant result is reported as
-  absence of evidence, never as evidence of absence.
+  replacement, then animals within cage). Hedges' g is computed over the
+  **contributing cages only**, with the stratified difference as its numerator and
+  the pooled within-cage SD as its denominator, so the effect size and the test
+  describe the same quantity — pooling every animal instead lets a cage with no
+  within-cage contrast move the effect size while leaving the statistic untouched.
+  With only five contributing cages the percentile cluster bootstrap is
+  **anti-conservative** (measured 91% coverage at a nominal 95%), and the report
+  says so rather than quietly presenting the interval as exact. A non-significant
+  result is reported as absence of evidence, never as evidence of absence.
 - **Multiplicity.** Benjamini–Hochberg FDR across the ~30-measure scan. The scan
   is labelled hypothesis-generating. A small **pre-specified primary set** is
   named in the configuration before the run: `distance_per_hour`,

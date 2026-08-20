@@ -12,6 +12,7 @@ enough to enumerate, so the test is exact rather than sampled.
 """
 from __future__ import annotations
 
+import warnings
 from itertools import combinations, product
 
 import numpy as np
@@ -102,23 +103,63 @@ def exact_stratified_permutation(values: pd.DataFrame) -> tuple[float, int, floa
         # Ties count as extreme: an exactly-equal split is not evidence against
         # the null and must not be scored in its favour.
         extreme += difference >= observed_difference - 1e-12
-    return extreme / total, total, 2.0 / total
+
+    # The floor is 2/total only if the fully sign-flipped assignment -- swap
+    # every contributing cage's mut/wt labels for their complement -- is
+    # itself one of the enumerated assignments. Flipping a cage's labels only
+    # preserves that cage's mut count (and so stays a valid assignment) when
+    # the cage is genotype-balanced (n_mut == n_wt); when it flips, the whole
+    # per-cage weighted sum flips sign, tying with the observed difference
+    # under abs() and guaranteeing 2 extreme assignments. If any contributing
+    # cage is unbalanced, that global flip is not a valid assignment, no
+    # other assignment is guaranteed to reproduce -observed_difference
+    # exactly, and only the observed assignment itself is guaranteed to tie.
+    balanced = all(
+        int(observed[cage].sum()) == len(cage_values[cage]) - int(observed[cage].sum())
+        for cage in cages if weights[cage] > 0
+    )
+    floor = 2.0 / total if balanced else 1.0 / total
+    return extreme / total, total, floor
 
 
 def hedges_g(values: pd.DataFrame) -> float:
-    """Standardised effect on cage-centred values, so cage offsets do not inflate it."""
-    frame = _split(values).copy()
-    frame["centred"] = frame["value"] - frame.groupby("cage")["value"].transform("mean")
-    mut = frame.loc[frame["genotype"] == "mut", "centred"].to_numpy()
-    wt = frame.loc[frame["genotype"] == "wt", "centred"].to_numpy()
-    if len(mut) < 2 or len(wt) < 2:
+    """Standardised version of the stratified difference, on the same cages.
+
+    A cage with weight 0 contributes no within-cage contrast to
+    `stratified_difference` and must contribute none here either: pooling its
+    animals into the effect size would describe a different quantity than the
+    p-value does. So this restricts to contributing cages (weight > 0), uses
+    `stratified_difference` itself as the numerator, and pools the
+    within-genotype variance across only those same cages for the
+    denominator, with the small-sample correction applied to the animal count
+    that actually entered that pooled variance.
+    """
+    cage_values, labels, weights = _prepare(values)
+    contributing = [cage for cage in cage_values if weights[cage] > 0]
+    if not contributing:
         return float("nan")
-    pooled = np.sqrt((((len(mut) - 1) * mut.var(ddof=1)) + ((len(wt) - 1) * wt.var(ddof=1)))
-                     / (len(mut) + len(wt) - 2))
-    if pooled == 0:
+    difference = _difference_from_labels(cage_values, labels, weights)
+
+    pooled_ss = 0.0
+    pooled_df = 0
+    n_total = 0
+    for cage in contributing:
+        array = cage_values[cage]
+        is_mut = labels[cage]
+        mut, wt = array[is_mut], array[~is_mut]
+        if len(mut) < 2 or len(wt) < 2:
+            continue  # a within-genotype variance needs at least 2 animals to estimate
+        pooled_ss += (len(mut) - 1) * mut.var(ddof=1) + (len(wt) - 1) * wt.var(ddof=1)
+        pooled_df += (len(mut) - 1) + (len(wt) - 1)
+        n_total += len(mut) + len(wt)
+    if pooled_df <= 0:
         return float("nan")
-    d = (mut.mean() - wt.mean()) / pooled
-    correction = 1 - 3 / (4 * (len(mut) + len(wt)) - 9)
+
+    pooled_sd = np.sqrt(pooled_ss / pooled_df)
+    if pooled_sd == 0:
+        return float("nan")
+    d = difference / pooled_sd
+    correction = 1 - 3 / (4 * n_total - 9)
     return float(d * correction)
 
 
@@ -129,8 +170,11 @@ def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
     Resampling cages is what makes this interval honest: the cage, not the animal,
     is the unit that repeats if the study were run again.
 
-    5000 draws keeps a thirty-measure scan to seconds rather than minutes; the
-    interval's third decimal is not what any conclusion here rests on.
+    5000 draws is not cheap: `compare` (bootstrap + exact permutation + mixed
+    model) measured at ~4.7 s per measure, so a thirty-measure `scan` costs on
+    the order of two minutes, not seconds. That cost buys more decimal places
+    on the interval than any conclusion here rests on, but it is not lowered
+    silently -- see the module-level note in `scan`.
     """
     frame = _split(values)
     weights = cage_weights(frame).set_index("cage")["weight"].to_dict()
@@ -155,18 +199,35 @@ def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
 
 
 def mixed_model(values: pd.DataFrame) -> dict:
-    """Sensitivity check: value ~ genotype with cage as a random intercept."""
+    """Sensitivity check: value ~ genotype with cage as a random intercept.
+
+    statsmodels signals a failed or boundary fit by *warning*
+    (ConvergenceWarning: "failed to converge", "on the boundary of the
+    parameter space", "Hessian ... is not positive definite", ...), not by
+    raising -- a bare try/except therefore misses it and reports
+    `converged: True` with an se and p-value drawn from a singular Hessian.
+    Every warning raised during the fit call is caught instead of left to
+    print to stderr (which would spray across a thirty-measure scan) and is
+    treated as a convergence failure: `converged` is forced to False and the
+    warning text is kept in `note`, alongside the coefficient/se/p-value
+    statsmodels still reports, so a caller can see both the number and the
+    reason not to trust it.
+    """
     import statsmodels.formula.api as smf
 
     frame = _split(values).copy()
     frame["is_mut"] = (frame["genotype"] == "mut").astype(float)
     try:
-        fit = smf.mixedlm("value ~ is_mut", frame, groups=frame["cage"]).fit()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit = smf.mixedlm("value ~ is_mut", frame, groups=frame["cage"]).fit()
     except Exception as error:  # noqa: BLE001 - convergence failure is a result, not a crash
         return {"coefficient": float("nan"), "se": float("nan"),
                 "p_value": float("nan"), "converged": False, "note": str(error)}
+    converged = bool(fit.converged) and not caught
+    note = "; ".join(str(warning.message) for warning in caught)
     return {"coefficient": float(fit.params["is_mut"]), "se": float(fit.bse["is_mut"]),
-            "p_value": float(fit.pvalues["is_mut"]), "converged": bool(fit.converged)}
+            "p_value": float(fit.pvalues["is_mut"]), "converged": converged, "note": note}
 
 
 def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
@@ -200,12 +261,30 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
         "ci_low": low, "ci_high": high,
         "hedges_g": hedges_g(values),
         "p_value": p, "assignments": assignments, "min_attainable_p": floor,
-        "lmm_coefficient": model["coefficient"], "lmm_p_value": model["p_value"],
-        "lmm_converged": model["converged"],
+        "lmm_coefficient": model["coefficient"], "lmm_se": model["se"],
+        "lmm_p_value": model["p_value"], "lmm_converged": model["converged"],
+        "lmm_note": model["note"],
     }
 
 
+# The columns `compare` produces, in order -- kept alongside `scan` so an
+# all-skipped scan can still return a frame with the right shape instead of
+# one with no columns at all (which would KeyError on `p_adjusted_bh`).
+_COMPARE_COLUMNS = [
+    "measure", "n_mut", "n_wt", "cages_contributing", "mean_mut", "mean_wt", "difference",
+    "ci_low", "ci_high", "hedges_g", "p_value", "assignments", "min_attainable_p",
+    "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
+]
+
+
 def scan(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
+    """Run `compare` over every measure and rank by p-value.
+
+    `compare` is not cheap (~4.7 s measured per call: exact enumeration +
+    5000-draw bootstrap + a mixed model), so a thirty-measure scan costs on
+    the order of two minutes. That is deliberate -- see `cluster_bootstrap_ci`
+    -- and not something to silently claw back by lowering a default here.
+    """
     rows, skipped = [], []
     for measure in measures:
         if measure not in profile.columns:
@@ -218,9 +297,15 @@ def scan(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
             rows.append(compare(profile, measure))
         except ValueError as error:
             skipped.append(f"{measure} ({error})")
-    table = pd.DataFrame(rows)
-    if table.empty:
+    if not rows:
+        # No contributing measure: still return the expected columns (so
+        # `frame["p_adjusted_bh"]` does not KeyError on an empty scan) and
+        # keep the skip audit trail, attached as frame metadata since there
+        # is no row left to broadcast it into.
+        table = pd.DataFrame(columns=_COMPARE_COLUMNS + ["p_adjusted_bh", "skipped_measures"])
+        table.attrs["skipped_measures"] = skipped
         return table
+    table = pd.DataFrame(rows)
     table["p_adjusted_bh"] = benjamini_hochberg(table["p_value"].to_numpy())
     table["skipped_measures"] = "; ".join(skipped)
     return table.sort_values("p_value").reset_index(drop=True)
