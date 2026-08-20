@@ -63,6 +63,12 @@ def intradaily_variability(series: pd.Series) -> float:
     Differences are taken on the regular hourly grid, so a recording gap is never
     bridged into a same-hour difference between the samples on either side of it;
     a difference is used only when both of its endpoints are real (finite) hours.
+
+    Written in gap-safe form: IV = (mean of squared valid differences) / (population
+    variance of the finite values). This avoids an explicit sample-count multiplier
+    that would assume the valid differences form one contiguous run (false whenever
+    there are two or more separate gaps); it is algebraically identical to the
+    classic n*sum(d^2) / ((n-1)*sum((x-xbar)^2)) whenever there are no gaps at all.
     """
     values = _as_hourly(series).to_numpy(dtype=float)
     if len(values) < 2:
@@ -75,9 +81,8 @@ def intradaily_variability(series: pd.Series) -> float:
     finite_values = values[np.isfinite(values)]
     if len(finite_values) < 2:
         return float("nan")
-    n = len(valid_diffs) + 1
-    numerator = n * np.sum(valid_diffs ** 2)
-    denominator = (len(finite_values) - 1) * np.sum((finite_values - finite_values.mean()) ** 2)
+    numerator = np.mean(valid_diffs ** 2)
+    denominator = np.mean((finite_values - finite_values.mean()) ** 2)
     return float(numerator / denominator) if denominator else float("nan")
 
 

@@ -58,32 +58,52 @@ def test_intradaily_variability_does_not_bridge_a_recording_gap():
         "2026-07-12 05:00", "2026-07-12 06:00",
     ])
     series = pd.Series([0.0, 10.0, 0.0, 10.0, 0.0], index=index)
-    # Gap-aware: only consecutive-hour pairs count. Valid diffs (both endpoints finite):
-    # 00->01 = 10, 01->02 = -10, 05->06 = -10 -> 3 diffs, n = 3 + 1 = 4.
-    # numerator = 4 * (10^2 + 10^2 + 10^2) = 1200.
-    # finite values = [0, 10, 0, 10, 0], mean = 4, sum((x-mean)^2) = 120.
-    # denominator = (5 - 1) * 120 = 480. IV = 1200 / 480 = 2.5.
+    # Gap-safe: only consecutive-hour pairs count, and gap-spanning steps are dropped
+    # rather than bridged. Finite values are [0, 10, 0, 10, 0]; mean = 4, sum of squared
+    # deviations = 120, so the population variance (ddof=0) is 120 / 5 = 24. Valid diffs
+    # (both endpoints finite) are 00->01 = 10, 01->02 = -10, 05->06 = -10, so the mean
+    # squared difference is (100 + 100 + 100) / 3 = 100. IV = 100 / 24 = 4.166667.
     # (A bridging implementation would instead treat 02:00 -> 05:00 as one consecutive
     # step, changing the diffs used and giving a different, wrong, answer.)
-    assert round(intradaily_variability(series), 6) == 2.5
+    assert round(intradaily_variability(series), 6) == round(100 / 24, 6)
+
+
+def test_relative_amplitude_stays_within_zero_and_one_for_a_nonnegative_signal():
+    # Activity (distance travelled) cannot be negative, so the noise is clipped so the
+    # signal never goes below zero. With a flat-zero trough and substantial noise, many
+    # low-block hours get floored to exactly 0, pushing L5 close to zero and RA close to
+    # (but never above) 1 -- a real test of the [0, 1] bound, not a trivial one far from
+    # either boundary. On a non-negative signal the mean 24-hour profile gives windows
+    # that are themselves means of non-negative numbers, so M10 >= L5 >= 0 and RA in
+    # [0, 1] hold by construction for this implementation.
+    day_pattern = np.array([20.0] * 10 + [0.0] * 14)
+    rng = np.random.default_rng(3)
+    noise = rng.normal(0, 2.0, size=24 * 30)
+    values = np.clip(np.tile(day_pattern, 30) + noise, 0, None)
+    index = pd.date_range("2026-07-12", periods=24 * 30, freq="h")
+    series = pd.Series(values, index=index)
+    result = relative_amplitude(series)
+    assert 0.0 <= result["L5"]
+    assert 0.0 <= result["RA"] <= 1.0
 
 
 def test_relative_amplitude_is_stable_across_recording_length():
-    # Fixed diurnal pattern (10 hours on at 20, 14 hours off at 0) with small,
-    # independently seeded per-hour noise. The mean-24-hour-profile definition should
-    # give nearly the same RA whether the recording is short or long; a whole-series
-    # rolling-window definition drifts with recording length instead (it lets a longer
-    # recording pick a more extreme window).
-    day_pattern = np.array([20.0] * 10 + [0.0] * 14)
+    # Fixed diurnal pattern (10 hours on at 20, 14 hours off at 3) with noise, clipped so
+    # the signal stays non-negative. The mean-24-hour-profile definition gives nearly the
+    # same RA whether the recording is short or long; a whole-series rolling-window
+    # definition drifts instead, because a longer recording gives the rolling min/max
+    # more windows to pick an extreme one from.
+    day_pattern = np.array([20.0] * 10 + [3.0] * 14)
 
-    def make_series(days, seed):
+    def make_series(days, seed, sigma=1.5):
         rng = np.random.default_rng(seed)
-        noise = rng.normal(0, 0.5, size=24 * days)
+        noise = rng.normal(0, sigma, size=24 * days)
+        values = np.clip(np.tile(day_pattern, days) + noise, 0, None)
         index = pd.date_range("2026-07-12", periods=24 * days, freq="h")
-        return pd.Series(np.tile(day_pattern, days) + noise, index=index)
+        return pd.Series(values, index=index)
 
-    short = relative_amplitude(make_series(days=3, seed=7))
-    long = relative_amplitude(make_series(days=60, seed=8))
+    short = relative_amplitude(make_series(days=3, seed=5))
+    long = relative_amplitude(make_series(days=90, seed=105))
     assert abs(short["RA"] - long["RA"]) < 0.05
 
 
