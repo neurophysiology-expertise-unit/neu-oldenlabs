@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from neu_oldenlabs.profile import PRIMARY_MEASURES, build_profile
 
@@ -84,3 +85,44 @@ def test_primary_measures_are_all_present_as_columns():
     table = build_profile(daily, circadian_table(), animal_table())
     for measure in PRIMARY_MEASURES:
         assert measure in table.columns
+
+
+def test_animal_in_daily_data_but_absent_from_animal_table_raises():
+    daily = daily_table({"all": {"distance_cm": 100.0}}, cage=1, tag=1)
+    other_animal = animal_table(cage=1, tag=2)
+    with pytest.raises(ValueError, match="1-1"):
+        build_profile(daily, circadian_table(cage=1, tag=1), other_animal)
+
+
+def test_animal_in_animal_table_but_absent_from_daily_data_raises():
+    daily = daily_table({"all": {"distance_cm": 100.0}}, cage=1, tag=1)
+    animals = pd.concat([animal_table(cage=1, tag=1), animal_table(cage=1, tag=2)],
+                        ignore_index=True)
+    with pytest.raises(ValueError, match="1-2"):
+        build_profile(daily, circadian_table(cage=1, tag=1), animals)
+
+
+def test_animal_missing_from_circadian_table_raises():
+    daily = daily_table({"all": {"distance_cm": 100.0}}, cage=1, tag=1)
+    circadian = circadian_table(cage=1, tag=2)
+    with pytest.raises(ValueError, match="1-1"):
+        build_profile(daily, circadian, animal_table(cage=1, tag=1))
+
+
+def test_duplicate_cage_tag_row_still_raises():
+    daily = daily_table({"all": {"distance_cm": 100.0}}, cage=1, tag=1)
+    duplicated_animals = pd.concat([animal_table(cage=1, tag=1), animal_table(cage=1, tag=1)],
+                                   ignore_index=True)
+    with pytest.raises(ValueError):
+        build_profile(daily, circadian_table(cage=1, tag=1), duplicated_animals)
+
+
+def test_missing_n_days_counts_as_zero_and_still_triggers_blanking():
+    # This animal has only "light"/"dark" rows, no "all"-phase rows, so day_counts
+    # has no entry for it at all -- n_days must land as 0, not NaN, so the
+    # min-days blanking below still fires for the animal with the least data.
+    daily = daily_table({"dark": {"distance_cm": 50.0}, "light": {"distance_cm": 60.0}},
+                        days=10)
+    row = build_profile(daily, circadian_table(), animal_table(), min_days=5).iloc[0]
+    assert row["n_days"] == 0
+    assert np.isnan(row["distance_cm_dark"])
