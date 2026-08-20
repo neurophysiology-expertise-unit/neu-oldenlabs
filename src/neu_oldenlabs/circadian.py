@@ -58,21 +58,42 @@ def interdaily_stability(series: pd.Series) -> float:
 
 
 def intradaily_variability(series: pd.Series) -> float:
-    """Fragmentation: mean squared hour-to-hour change over the variance."""
+    """Fragmentation: mean squared hour-to-hour change over the variance.
+
+    Differences are taken on the regular hourly grid, so a recording gap is never
+    bridged into a same-hour difference between the samples on either side of it;
+    a difference is used only when both of its endpoints are real (finite) hours.
+    """
     values = _as_hourly(series).to_numpy(dtype=float)
-    finite = values[np.isfinite(values)]
-    if len(finite) < 2:
+    if len(values) < 2:
         return float("nan")
-    numerator = len(finite) * np.sum(np.diff(finite) ** 2)
-    denominator = (len(finite) - 1) * np.sum((finite - finite.mean()) ** 2)
+    diffs = values[1:] - values[:-1]
+    pair_is_finite = np.isfinite(values[:-1]) & np.isfinite(values[1:])
+    valid_diffs = diffs[pair_is_finite]
+    if len(valid_diffs) < 2:
+        return float("nan")
+    finite_values = values[np.isfinite(values)]
+    if len(finite_values) < 2:
+        return float("nan")
+    n = len(valid_diffs) + 1
+    numerator = n * np.sum(valid_diffs ** 2)
+    denominator = (len(finite_values) - 1) * np.sum((finite_values - finite_values.mean()) ** 2)
     return float(numerator / denominator) if denominator else float("nan")
 
 
 def relative_amplitude(series: pd.Series) -> dict:
-    """Highest ten and lowest five consecutive hours, and their contrast."""
+    """Highest ten and lowest five consecutive hours of the mean 24-hour profile.
+
+    The hourly values are first averaged by clock hour into a single 24-point mean
+    daily profile, so the result does not drift with recording length. The 10-hour
+    and 5-hour windows are taken over that profile treated as circular (a window
+    may wrap past midnight), by rolling over the profile concatenated with itself.
+    """
     values = _as_hourly(series)
-    ten = values.rolling(10, min_periods=10).mean()
-    five = values.rolling(5, min_periods=5).mean()
+    profile = values.groupby(values.index.hour).mean().reindex(range(24))
+    extended = pd.concat([profile, profile], ignore_index=True)
+    ten = extended.rolling(10, min_periods=10).mean().iloc[9:33]
+    five = extended.rolling(5, min_periods=5).mean().iloc[4:28]
     m10 = float(ten.max())
     l5 = float(five.min())
     total = m10 + l5
