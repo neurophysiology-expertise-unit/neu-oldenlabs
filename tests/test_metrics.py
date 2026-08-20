@@ -72,12 +72,25 @@ def test_max_measures_take_the_maximum():
 
 
 def test_habituation_drops_the_first_calendar_days_per_cage():
+    # Two cages with disjoint date ranges, cage 2 starting well after cage 1 ends.
+    # A regression that replaced per-cage grouping with a single sorted-date slice
+    # across the whole table would keep all of cage 2's dates (they all sort after
+    # cage 1's), so this only passes if the drop is computed per cage.
     table = pd.DataFrame({
-        "cage": [1, 1, 1], "tag": [1, 1, 1],
-        "date": [pd.Timestamp("2026-07-11").date(), pd.Timestamp("2026-07-12").date(),
-                 pd.Timestamp("2026-07-13").date()],
-        "phase": ["all"] * 3, "measure": ["distance_cm"] * 3,
-        "value": [1.0, 2.0, 3.0], "valid_hours": [1.0, 24.0, 24.0],
+        "cage": [1, 1, 1, 1, 2, 2, 2, 2],
+        "tag": [1, 1, 1, 1, 1, 1, 1, 1],
+        "date": [
+            pd.Timestamp("2026-07-11").date(), pd.Timestamp("2026-07-12").date(),
+            pd.Timestamp("2026-07-13").date(), pd.Timestamp("2026-07-14").date(),
+            pd.Timestamp("2026-07-20").date(), pd.Timestamp("2026-07-21").date(),
+            pd.Timestamp("2026-07-22").date(), pd.Timestamp("2026-07-23").date(),
+        ],
+        "phase": ["all"] * 8, "measure": ["distance_cm"] * 8,
+        "value": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "valid_hours": [1.0, 24.0, 24.0, 24.0, 1.0, 24.0, 24.0, 24.0],
     })
     kept = drop_habituation(table, days=1)
-    assert [str(d) for d in kept["date"]] == ["2026-07-13"]
+    cage1_dates = [str(d) for d in kept[kept["cage"] == 1]["date"]]
+    cage2_dates = [str(d) for d in kept[kept["cage"] == 2]["date"]]
+    assert cage1_dates == ["2026-07-13", "2026-07-14"]
+    assert cage2_dates == ["2026-07-22", "2026-07-23"]

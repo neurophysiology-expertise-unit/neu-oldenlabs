@@ -74,7 +74,8 @@ def drop_habituation(table: pd.DataFrame, days: int) -> pd.DataFrame:
     """Drop the first ``days`` calendar days of each cage's recording.
 
     The first day is a partial day and the animals have just been introduced to
-    the cage, so it measures handling, not phenotype.
+    the cage, so it measures handling, not phenotype. ``days=0`` means "drop
+    nothing" -- it does not still drop the leading partial day.
     """
     if days <= 0:
         return table
