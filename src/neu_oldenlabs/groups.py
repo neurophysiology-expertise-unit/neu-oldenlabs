@@ -1,0 +1,226 @@
+"""Compare mutant against wildtype with the cage as a stratum.
+
+Animals are nested in cages, and cages differ for reasons that have nothing to do
+with genotype: housing, cohort, and -- for the social measures -- which genotypes
+the cage-mates carry. So the statistic is the weighted mean of *within-cage*
+differences, and the permutation shuffles genotype labels only inside a cage. A
+cage housing one genotype only carries no within-cage contrast, gets weight zero,
+and drops out of the test by construction rather than silently shifting a mean.
+
+The design admits 10 * 10 * 4 * 2 * 6 = 4800 label assignments, which is small
+enough to enumerate, so the test is exact rather than sampled.
+"""
+from __future__ import annotations
+
+from itertools import combinations, product
+
+import numpy as np
+import pandas as pd
+
+from . import RNG_SEED
+
+
+def _split(values: pd.DataFrame) -> pd.DataFrame:
+    frame = values.dropna(subset=["value"]).copy()
+    unexpected = sorted(set(frame["genotype"]) - {"mut", "wt"})
+    if unexpected:
+        raise ValueError(f"genotype must be 'mut' or 'wt', got {unexpected}")
+    return frame
+
+
+def cage_weights(values: pd.DataFrame) -> pd.DataFrame:
+    frame = _split(values)
+    counts = (frame.groupby(["cage", "genotype"]).size().unstack(fill_value=0)
+              .reindex(columns=["mut", "wt"], fill_value=0).reset_index())
+    counts.columns = ["cage", "n_mut", "n_wt"]
+    total = counts["n_mut"] + counts["n_wt"]
+    counts["weight"] = np.where(total > 0, counts["n_mut"] * counts["n_wt"] / total, 0.0)
+    return counts
+
+
+def _difference_from_labels(cage_values: dict, labels: dict, weights: dict) -> float:
+    numerator = denominator = 0.0
+    for cage, array in cage_values.items():
+        weight = weights[cage]
+        if weight == 0:
+            continue
+        is_mut = labels[cage]
+        numerator += weight * (array[is_mut].mean() - array[~is_mut].mean())
+        denominator += weight
+    return numerator / denominator if denominator else float("nan")
+
+
+def _prepare(values: pd.DataFrame):
+    frame = _split(values)
+    weights = cage_weights(frame).set_index("cage")["weight"].to_dict()
+    cage_values, observed_labels = {}, {}
+    for cage, block in frame.groupby("cage", sort=True):
+        cage_values[cage] = block["value"].to_numpy(dtype=float)
+        observed_labels[cage] = (block["genotype"] == "mut").to_numpy()
+    return cage_values, observed_labels, weights
+
+
+def stratified_difference(values: pd.DataFrame) -> float:
+    cage_values, labels, weights = _prepare(values)
+    return _difference_from_labels(cage_values, labels, weights)
+
+
+def count_assignments(values: pd.DataFrame) -> int:
+    cage_values, labels, _ = _prepare(values)
+    total = 1
+    for cage, array in cage_values.items():
+        n, k = len(array), int(labels[cage].sum())
+        total *= len(list(combinations(range(n), k)))
+    return total
+
+
+def exact_stratified_permutation(values: pd.DataFrame) -> tuple[float, int, float]:
+    """Enumerate every within-cage relabelling. Returns (p, assignments, min p)."""
+    cage_values, observed, weights = _prepare(values)
+    observed_difference = abs(_difference_from_labels(cage_values, observed, weights))
+
+    # Every cage is enumerated, including any that houses a single genotype. Such
+    # a cage admits exactly C(n, n) == 1 relabelling and contributes nothing to the
+    # statistic, so enumerating it costs nothing and keeps this count identical to
+    # `count_assignments` without any correction after the fact.
+    cages = sorted(cage_values)
+    per_cage = []
+    for cage in cages:
+        n, k = len(cage_values[cage]), int(observed[cage].sum())
+        options = []
+        for pick in combinations(range(n), k):
+            mask = np.zeros(n, dtype=bool)
+            mask[list(pick)] = True
+            options.append(mask)
+        per_cage.append(options)
+
+    extreme = total = 0
+    for combination in product(*per_cage):
+        labels = dict(zip(cages, combination))
+        difference = abs(_difference_from_labels(cage_values, labels, weights))
+        total += 1
+        # Ties count as extreme: an exactly-equal split is not evidence against
+        # the null and must not be scored in its favour.
+        extreme += difference >= observed_difference - 1e-12
+    return extreme / total, total, 2.0 / total
+
+
+def hedges_g(values: pd.DataFrame) -> float:
+    """Standardised effect on cage-centred values, so cage offsets do not inflate it."""
+    frame = _split(values).copy()
+    frame["centred"] = frame["value"] - frame.groupby("cage")["value"].transform("mean")
+    mut = frame.loc[frame["genotype"] == "mut", "centred"].to_numpy()
+    wt = frame.loc[frame["genotype"] == "wt", "centred"].to_numpy()
+    if len(mut) < 2 or len(wt) < 2:
+        return float("nan")
+    pooled = np.sqrt((((len(mut) - 1) * mut.var(ddof=1)) + ((len(wt) - 1) * wt.var(ddof=1)))
+                     / (len(mut) + len(wt) - 2))
+    if pooled == 0:
+        return float("nan")
+    d = (mut.mean() - wt.mean()) / pooled
+    correction = 1 - 3 / (4 * (len(mut) + len(wt)) - 9)
+    return float(d * correction)
+
+
+def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
+                         level: float = 0.95) -> tuple[float, float]:
+    """Resample cages, then animals within genotype within cage.
+
+    Resampling cages is what makes this interval honest: the cage, not the animal,
+    is the unit that repeats if the study were run again.
+
+    5000 draws keeps a thirty-measure scan to seconds rather than minutes; the
+    interval's third decimal is not what any conclusion here rests on.
+    """
+    frame = _split(values)
+    weights = cage_weights(frame).set_index("cage")["weight"].to_dict()
+    cages = [cage for cage in sorted(frame["cage"].unique()) if weights[cage] > 0]
+    blocks = {cage: {genotype: block["value"].to_numpy(dtype=float)
+                     for genotype, block in frame[frame["cage"] == cage].groupby("genotype")}
+              for cage in cages}
+    rng = np.random.default_rng(RNG_SEED)
+    estimates = np.empty(draws)
+    for draw in range(draws):
+        picked = rng.choice(cages, len(cages), replace=True)
+        numerator = denominator = 0.0
+        for cage in picked:
+            weight = weights[cage]
+            mut = rng.choice(blocks[cage]["mut"], len(blocks[cage]["mut"]), replace=True)
+            wt = rng.choice(blocks[cage]["wt"], len(blocks[cage]["wt"]), replace=True)
+            numerator += weight * (mut.mean() - wt.mean())
+            denominator += weight
+        estimates[draw] = numerator / denominator
+    tail = (1 - level) / 2
+    return float(np.quantile(estimates, tail)), float(np.quantile(estimates, 1 - tail))
+
+
+def mixed_model(values: pd.DataFrame) -> dict:
+    """Sensitivity check: value ~ genotype with cage as a random intercept."""
+    import statsmodels.formula.api as smf
+
+    frame = _split(values).copy()
+    frame["is_mut"] = (frame["genotype"] == "mut").astype(float)
+    try:
+        fit = smf.mixedlm("value ~ is_mut", frame, groups=frame["cage"]).fit()
+    except Exception as error:  # noqa: BLE001 - convergence failure is a result, not a crash
+        return {"coefficient": float("nan"), "se": float("nan"),
+                "p_value": float("nan"), "converged": False, "note": str(error)}
+    return {"coefficient": float(fit.params["is_mut"]), "se": float(fit.bse["is_mut"]),
+            "p_value": float(fit.pvalues["is_mut"]), "converged": bool(fit.converged)}
+
+
+def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
+    p_values = np.asarray(p_values, dtype=float)
+    order = np.argsort(p_values)
+    ranked = p_values[order] * len(p_values) / np.arange(1, len(p_values) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    adjusted = np.empty_like(ranked)
+    adjusted[order] = np.clip(ranked, 0, 1)
+    return adjusted
+
+
+def compare(profile: pd.DataFrame, measure: str) -> dict:
+    values = profile[["animal_id", "cage", "genotype", measure]].rename(
+        columns={measure: "value"}).dropna(subset=["value"])
+    weights = cage_weights(values)
+    contributing = int((weights["weight"] > 0).sum())
+    if contributing == 0:
+        raise ValueError(f"{measure}: no cage contains both genotypes; nothing to compare")
+    p, assignments, floor = exact_stratified_permutation(values)
+    low, high = cluster_bootstrap_ci(values)
+    model = mixed_model(values)
+    return {
+        "measure": measure,
+        "n_mut": int((values["genotype"] == "mut").sum()),
+        "n_wt": int((values["genotype"] == "wt").sum()),
+        "cages_contributing": contributing,
+        "mean_mut": float(values.loc[values["genotype"] == "mut", "value"].mean()),
+        "mean_wt": float(values.loc[values["genotype"] == "wt", "value"].mean()),
+        "difference": stratified_difference(values),
+        "ci_low": low, "ci_high": high,
+        "hedges_g": hedges_g(values),
+        "p_value": p, "assignments": assignments, "min_attainable_p": floor,
+        "lmm_coefficient": model["coefficient"], "lmm_p_value": model["p_value"],
+        "lmm_converged": model["converged"],
+    }
+
+
+def scan(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
+    rows, skipped = [], []
+    for measure in measures:
+        if measure not in profile.columns:
+            skipped.append(f"{measure} (absent)")
+            continue
+        if profile[measure].nunique(dropna=True) <= 1:
+            skipped.append(f"{measure} (constant)")
+            continue
+        try:
+            rows.append(compare(profile, measure))
+        except ValueError as error:
+            skipped.append(f"{measure} ({error})")
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table
+    table["p_adjusted_bh"] = benjamini_hochberg(table["p_value"].to_numpy())
+    table["skipped_measures"] = "; ".join(skipped)
+    return table.sort_values("p_value").reset_index(drop=True)
