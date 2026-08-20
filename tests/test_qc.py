@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pandas as pd
+import pytest
+
 from neu_oldenlabs.io import load_cage
 from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, range_violations,
-                              recording_breaks, rack_summary)
+                              recording_breaks, rack_summary, valid_bins)
 
 
 def out_of_rack_in_bin_two(measure, tag, index):
@@ -62,3 +65,54 @@ def test_percentages_outside_zero_to_hundred_are_reported_not_corrected(make_wor
     row = violations[violations["measure"] == "time_eating_pct"].iloc[0]
     assert row["n_violations"] == 2
     assert long.loc[long["measure"] == "time_eating_pct", "value"].max() == 150.0
+
+
+def test_valid_bins_raises_on_non_finite_in_rack_value(make_workbook):
+    """Test that non-finite in_rack values (NaN, inf) cause a crash."""
+    def nan_in_rack(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return float('nan')
+        return 5.0
+
+    path = make_workbook(tags=(1,), bins=2, values=nan_in_rack)
+    long = load_cage(path, 58616)
+
+    with pytest.raises(ValueError, match="non-finite in_rack values"):
+        valid_bins(long)
+
+
+def test_valid_bins_raises_when_in_rack_measure_missing(make_workbook):
+    """Test that absence of in_rack measure causes a crash."""
+    path = make_workbook(tags=(1,), bins=2)
+    long = load_cage(path, 58616)
+
+    # Remove all in_rack measures
+    long_without_rack = long[long["measure"] != "in_rack"]
+
+    with pytest.raises(ValueError, match="no 'in_rack' measure"):
+        valid_bins(long_without_rack)
+
+
+def test_apply_rack_mask_raises_on_structurally_missing_rack_status(make_workbook):
+    """Test that a bin with no rack status row causes a crash."""
+    path = make_workbook(tags=(1,), bins=2)
+    long = load_cage(path, 58616)
+
+    # Add a fake row with a bin_start that has no corresponding in_rack measure
+    first_bin = long["bin_start"].iloc[0]
+    fake_bin_start = first_bin + pd.Timedelta(hours=100)
+
+    fake_row = pd.DataFrame({
+        "cage": [58616],
+        "tag": [1],
+        "bin_start": [fake_bin_start],
+        "bin_end": [fake_bin_start + pd.Timedelta(minutes=10)],
+        "duration_s": [600.0],
+        "measure": ["activity_counts"],
+        "value": [50.0]
+    })
+
+    long_with_orphan = pd.concat([long, fake_row], ignore_index=True)
+
+    with pytest.raises(ValueError, match="bins with no rack status"):
+        apply_rack_mask(long_with_orphan)

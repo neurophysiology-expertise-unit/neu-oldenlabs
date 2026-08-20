@@ -6,6 +6,7 @@ are excluded from every metric rather than averaged into one.
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from .io import PERCENT_MEASURES
@@ -16,7 +17,18 @@ def valid_bins(long: pd.DataFrame) -> pd.DataFrame:
     if rack.empty:
         raise ValueError("no 'in_rack' measure in this export; cannot build the rack mask")
     mask = rack[["cage", "tag", "bin_start", "value"]].copy()
-    mask["valid"] = mask.pop("value") > 0
+    values = mask.pop("value")
+    non_finite = ~np.isfinite(values)
+    if non_finite.any():
+        bad = mask[non_finite]
+        cage_count = bad["cage"].nunique()
+        tag_count = bad["tag"].nunique()
+        bin_count = len(bad)
+        raise ValueError(
+            f"non-finite in_rack values: {bin_count} bins across {tag_count} tag(s) "
+            f"in {cage_count} cage(s)"
+        )
+    mask["valid"] = values > 0
     return mask
 
 
