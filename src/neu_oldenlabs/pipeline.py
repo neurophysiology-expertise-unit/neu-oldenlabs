@@ -81,14 +81,25 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
 
     if _any_cage_has_both_genotypes(profile_table):
         scan_table = groups.scan(profile_table, measures)
+        scan_table.to_csv(output / "group_comparison.csv", index=False)
     else:
-        scan_table = pd.DataFrame({
-            "note": ["no loaded cage contains both genotypes; group comparison skipped"],
-        })
+        # No loaded cage contributes a within-cage contrast (the all-wildtype
+        # case -- the real study's only currently-loaded cage, 58616, is
+        # exactly this). Mirror `groups.scan`'s own idiom for "nothing to
+        # compare": the returned table is genuinely empty (no `measure` rows,
+        # so it carries no comparison data a caller could mistake for a real
+        # result) with the reason attached as metadata, the same way `scan`
+        # attaches `skipped_measures` to its own empty frame. The written
+        # CSV is a separate one-row rendering of that same reason, because a
+        # human reading `group_comparison.csv` needs the explanation on the
+        # page, not only in an in-memory attribute.
+        reason = "no loaded cage contains both genotypes; group comparison skipped"
+        scan_table = pd.DataFrame(columns=["note"])
+        scan_table.attrs["note"] = reason
+        pd.DataFrame({"note": [reason]}).to_csv(output / "group_comparison.csv", index=False)
 
     daily_table.to_csv(output / "daily_measures.csv", index=False)
     profile_table.to_csv(output / "animal_profile.csv", index=False)
-    scan_table.to_csv(output / "group_comparison.csv", index=False)
     for name, table in qc_tables.items():
         table.to_csv(output / f"qc_{name}.csv", index=False)
 

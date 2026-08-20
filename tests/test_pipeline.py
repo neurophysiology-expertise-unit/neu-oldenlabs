@@ -28,3 +28,28 @@ def test_every_figure_writes_its_values_as_csv(synthetic_study, tmp_path):
     figures = sorted(p.stem for p in (output / "figures").glob("*.png"))
     tables = sorted(p.stem for p in (output / "figures").glob("*.csv"))
     assert figures and figures == tables
+
+
+def test_all_wildtype_study_writes_a_note_and_skips_effect_forest(all_wildtype_study, tmp_path):
+    # This mirrors the real study's current live shape: cage 58616 is the only
+    # export that exists, and it is five wildtype animals with no mutants. The
+    # pipeline must not raise on this -- it must produce a complete descriptive
+    # output, since that is what the study owner gets today.
+    output = tmp_path / "out"
+    result = run_study(all_wildtype_study, output, cache_dir=None)
+
+    assert result["scan"].empty
+
+    comparison_path = output / "group_comparison.csv"
+    assert comparison_path.exists()
+    comparison_lines = comparison_path.read_text().splitlines()
+    assert comparison_lines[0].split(",") == ["note"]
+    assert "no loaded cage contains both genotypes" in comparison_lines[1]
+
+    figures = output / "figures"
+    assert not (figures / "effect_forest.png").exists()
+    assert not (figures / "effect_forest.csv").exists()
+
+    png_stems = sorted(p.stem for p in figures.glob("*.png"))
+    csv_stems = sorted(p.stem for p in figures.glob("*.csv"))
+    assert png_stems and png_stems == csv_stems

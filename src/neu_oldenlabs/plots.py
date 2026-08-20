@@ -17,6 +17,8 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
+from . import RNG_SEED
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
@@ -178,7 +180,7 @@ def cage_paired(profile: pd.DataFrame, output: Path, measures: list[str]) -> Non
 
     cages = sorted(profile["cage"].unique())
     positions = {cage: index for index, cage in enumerate(cages)}
-    rng = np.random.default_rng(20260820)
+    rng = np.random.default_rng(RNG_SEED)
 
     fig, axes = plt.subplots(1, len(measures), figsize=(3.2 * len(measures), 3.2), squeeze=False)
     present = set(table["genotype"]) if not table.empty else set()

@@ -96,3 +96,42 @@ def synthetic_study(tmp_path, make_workbook):
         "primary_measures": ["distance_cm_all"], "scan_measures": ["distance_cm_all"],
     }))
     return load_study(config)
+
+
+@pytest.fixture
+def all_wildtype_study(tmp_path, make_workbook):
+    """One all-wildtype cage, mirroring the real study's current live shape.
+
+    Cage 58616 is the only export that exists in the real study today, and it
+    houses five wildtype animals and no mutants (see the composition table in
+    tests/test_groups.py). This is not a hypothetical edge case: it is the
+    exact -- and currently only -- path the real pipeline takes, so it earns
+    its own fixture rather than being folded into `synthetic_study`, whose
+    two cages are both genotype-mixed.
+    """
+    import json
+
+    from neu_oldenlabs.config import load_study
+
+    def varying(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        return 1.0 + tag + (index % 7)
+
+    export = make_workbook(name="58616_x_cage.xlsx", tags=(1, 2, 3, 4, 5),
+                           bins=6 * 24 * 5, values=varying)
+    animals = tmp_path / "animals.csv"
+    rows = ["cage #,animal #,,genotype,tag #,Tag date,Monitoring start"]
+    for index, tag in enumerate((1, 2, 3, 4, 5), start=1):
+        prefix = "58616" if tag == 1 else ""
+        rows.append(f"{prefix},{index},L,W/w,{tag},,")
+    animals.write_text("\n".join(rows) + "\n")
+
+    config = tmp_path / "study.json"
+    config.write_text(json.dumps({
+        "name": "all_wildtype", "animals_csv": str(animals),
+        "cages": [{"cage": 58616, "export": str(export)}],
+        "habituation_days": 0, "lights_on": 7, "lights_off": 19, "min_days": 1,
+        "primary_measures": ["distance_cm_all"], "scan_measures": ["distance_cm_all"],
+    }))
+    return load_study(config)
