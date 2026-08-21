@@ -45,6 +45,21 @@ def _any_cage_has_both_genotypes(profile_table: pd.DataFrame) -> bool:
     return bool((counts >= 2).any())
 
 
+def _default_scan_measures(profile_table: pd.DataFrame) -> list[str]:
+    """Every profile measure column, minus identity fields and `acrophase_hour`.
+
+    Used when `study.scan_measures` is empty (no explicit list configured).
+    `acrophase_hour` is a CIRCULAR quantity (it wraps at 24h == 0h): real
+    values in this study sit at 0.6-1.3h, just above the wrap, so an animal
+    at 23.7h and one at 0.3h would be computed as 23.4h apart with the wrong
+    sign under an ordinary linear difference. A circular quantity must not be
+    differenced linearly, so it is excluded from the default scan (controller
+    ruling). It is still reported in the per-animal profile table for anyone
+    who wants to analyse it with a circular-appropriate statistic.
+    """
+    return [c for c in profile_table.columns if c not in IDENTITY and c != "acrophase_hour"]
+
+
 def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -> dict:
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -68,16 +83,24 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
     daily_table = metrics.drop_habituation(daily_table, study.habituation_days)
     daily_table = metrics.restrict_window(daily_table, study.window_start, study.window_end)
 
-    circadian_table = circadian.circadian_profile(masked_long)
+    # The circadian family (cosinor, IS/IV/RA -- IS is a pre-specified primary
+    # measure) must honour the same habituation exclusion and analysis window
+    # as the daily measures, or it silently describes a different slice of the
+    # recording. `drop_habituation`/`restrict_window` are generic over any
+    # table with "cage" and "date" columns, so they are reused here directly
+    # on the bin-level frame rather than duplicating the date logic.
+    circadian_long = masked_long.copy()
+    circadian_long["date"] = circadian_long["bin_start"].dt.date
+    circadian_long = metrics.drop_habituation(circadian_long, study.habituation_days)
+    circadian_long = metrics.restrict_window(circadian_long, study.window_start, study.window_end)
+    circadian_table = circadian.circadian_profile(circadian_long.drop(columns="date"))
 
     loaded_cages = {spec.cage for spec in study.available_cages}
     animals_loaded = animal_table[animal_table["cage"].isin(loaded_cages)].reset_index(drop=True)
 
     profile_table = build_profile(daily_table, circadian_table, animals_loaded, study.min_days)
 
-    measures = list(study.scan_measures)
-    if not measures:
-        measures = [c for c in profile_table.columns if c not in IDENTITY]
+    measures = list(study.scan_measures) or _default_scan_measures(profile_table)
 
     if _any_cage_has_both_genotypes(profile_table):
         scan_table = groups.scan(profile_table, measures)

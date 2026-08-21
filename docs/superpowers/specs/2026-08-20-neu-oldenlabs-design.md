@@ -194,7 +194,7 @@ manufacture an effect:
 
 ### 6.2 Phenotype profile
 
-One row per animal, ~30 columns. Each measure is computed over 24 h and
+One row per animal, 82 columns (8 identity columns, 74 measure columns). Each measure is computed over 24 h and
 separately for the light phase (07:00–19:00) and dark phase (19:00–07:00), with a
 dark/light ratio where it is meaningful. Light schedule: **12:12, lights on
 07:00**, per the study owner.
@@ -250,10 +250,18 @@ six cages are genotype-mixed.
   in the low nineties against a nominal 95% (91% and 93%) — and the report says so
   rather than quietly presenting the interval as exact. A non-significant
   result is reported as absence of evidence, never as evidence of absence.
-- **Multiplicity.** Benjamini–Hochberg FDR across the ~30-measure scan. The scan
-  is labelled hypothesis-generating. A small **pre-specified primary set** is
-  named in the configuration before the run: `distance_per_hour`,
-  `inactive_pct_dark`, `IS`, `social_distance_cm`, `aggression_events_per_day`.
+- **Multiplicity.** Benjamini–Hochberg FDR across the default scan, which is
+  every profile measure column (74) minus the circular `acrophase_hour` (see
+  below) — 73 measures, not "~30". The scan is labelled hypothesis-generating.
+  A small **pre-specified primary set** is named in the configuration before
+  the run: `distance_per_hour`, `inactive_pct_dark`, `IS`, `social_distance_cm`,
+  `aggression_events_per_day`.
+- **`acrophase_hour` is excluded from the default scan.** It is a circular
+  quantity (wraps at 24h == 0h): this study's real acrophases sit at
+  0.6–1.3h, just above the wrap, so an animal at 23.7h and one at 0.3h would
+  be differenced linearly as 23.4h apart with the wrong sign. It is still
+  reported in the per-animal profile table for anyone using a
+  circular-appropriate statistic on it.
 - **Sensitivity analysis.** `MixedLM(value ~ genotype, groups=cage)` from
   statsmodels, reported beside the permutation result. Where the two disagree,
   the disagreement is reported; neither is chosen post hoc for being the nicer

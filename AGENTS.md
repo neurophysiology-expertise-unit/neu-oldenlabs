@@ -5,8 +5,17 @@
   generated animal-level tables. Data are supplied by path at runtime.
 - Preserve Oldenlabs source semantics. Do not silently reinterpret or rename an
   exported measure. An unknown measure name is an error, not something to skip.
-- Bins are nominally 10 minutes but jitter between 9 and 11. Every aggregation is
-  weighted by the actual bin duration. A plain mean over bins is a bug.
+- Bin width is NOT fixed across exports and must never be assumed: the real
+  study's six cage exports use two different bin widths -- cage 58616 uses
+  600 s (10-minute) bins, the other five use 3600 s (60-minute, hourly)
+  bins -- and even within one export, a bin's own duration (`Datetime to`
+  minus `Datetime from`) can differ from its nominal width. Every
+  aggregation is weighted by each bin's actual duration, never a fixed
+  constant. A plain mean over bins is a bug, and so is any per-bin figure or
+  table that pools cages of different bin width without normalising to a
+  per-hour (or otherwise duration-weighted) basis first -- pooling raw
+  per-bin values across bin widths manufactures a difference that is pure
+  bin-width artefact, not signal.
 - Bins where `Cage in rack == 0` are excluded from every metric.
 - Every plotted quantity must also be written as a machine-readable table.
 - Analysis runs record input hashes and parameters in `provenance.json`.

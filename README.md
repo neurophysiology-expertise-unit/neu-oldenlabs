@@ -23,6 +23,27 @@ Run tests with:
 conda run -n neu-oldenlabs python -m pytest tests/ -v
 ```
 
+**Warning: `conda run -n neu-oldenlabs` can silently run the WRONG Python.**
+In some shell setups `conda run -n <env>` resolves to a Python from a
+different (often much older) environment than the one just created, with no
+error -- it has already misdirected a `pip install` for this project. Before
+relying on it, confirm which interpreter it actually invokes:
+
+```bash
+conda run -n neu-oldenlabs python -c "import sys; print(sys.executable, sys.version)"
+```
+
+If that does not print a `neu-oldenlabs`-environment path on Python 3.11, use
+the environment's interpreter by its absolute path instead, which cannot be
+misdirected:
+
+```bash
+$(conda info --envs | awk '/neu-oldenlabs/ {print $NF}')/bin/python -m pip install -e '.[test]'
+$(conda info --envs | awk '/neu-oldenlabs/ {print $NF}')/bin/python -m pytest tests/ -v
+```
+
+(or hardcode the path once you know it, e.g. `~/.conda/envs/neu-oldenlabs/bin/python`).
+
 ## No data in this repository
 
 Oldenlabs exports, the animal/genotype table, ear-tag identities, and any generated
@@ -111,9 +132,17 @@ exactly this case: five wildtype animals and no mutants.
 - **`aggression_events` is a count**, aggregated as events per valid hour (a day
   that lost bins to the rack mask is not scored as a day of low activity), so the
   profile column `aggression_events_all` is events **per hour**, not per day.
-- **The scan is hypothesis-generating.** The ~30-measure scan is FDR-corrected
-  (Benjamini–Hochberg); the pre-specified primary measures, named in `study.json`
-  before the run, are reported first and on their own terms.
+- **The scan is hypothesis-generating.** The default scan is FDR-corrected
+  (Benjamini–Hochberg) and covers every profile measure column except the
+  circular `acrophase_hour` (see below) — 73 measures in the current schema,
+  not "~30". The pre-specified primary measures, named in `study.json` before
+  the run, are reported first and on their own terms.
+- **`acrophase_hour` is excluded from the default scan.** It is a circular
+  quantity that wraps at 24h == 0h, so it must not be differenced linearly;
+  this study's real acrophases (0.6–1.3h) sit just above that wrap, where a
+  linear difference gets both the magnitude and the sign wrong. It still
+  appears as a column in the per-animal profile table for anyone applying a
+  circular-appropriate statistic to it directly.
 - **A non-significant result is absence of evidence, never evidence of absence.**
 - **Missing exports are named, not silently dropped.** A cage whose export has not
   arrived is declared with a null export in `study.json`, is never analysed as a
