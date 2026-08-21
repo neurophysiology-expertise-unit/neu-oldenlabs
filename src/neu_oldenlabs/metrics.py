@@ -39,12 +39,26 @@ KEYS = ["cage", "tag", "date"]
 
 
 def _aggregate_measure(block: pd.DataFrame, measure: str) -> pd.DataFrame:
-    """Apply one measure's rule to every (cage, tag, date) group at once."""
+    """Apply one measure's rule to every (cage, tag, date) group at once.
+
+    A bin's ``value`` can be missing (``io.load_cage`` coerces a malformed
+    cell, e.g. a literal ``'NaN'`` string, to NaN). The duration weight for a
+    group must count ONLY bins whose value is present -- ``seconds`` here is
+    the total duration of bins that actually have a value, not every bin in
+    the group -- otherwise a rate/mean's denominator includes minutes that
+    contributed nothing to its numerator, deflating the mean in proportion to
+    the missing fraction. A group with no present value at all then has
+    ``seconds == 0``, so every branch below divides by a value that
+    ``.replace(0, np.nan)`` turns into NaN, and the result is NaN, never the
+    ``0.0`` that ``pandas.Series.sum()`` would otherwise silently produce for
+    an all-NaN group.
+    """
     kind = MEASURE_KIND[measure]
     frame = block.copy()
     frame["weighted"] = frame["value"] * frame["duration_s"]
+    frame["duration_present"] = frame["duration_s"].where(frame["value"].notna(), 0.0)
     grouped = frame.groupby(KEYS, as_index=False).agg(
-        weighted=("weighted", "sum"), seconds=("duration_s", "sum"),
+        weighted=("weighted", "sum"), seconds=("duration_present", "sum"),
         total=("value", "sum"), peak=("value", "max"))
     grouped["valid_hours"] = grouped["seconds"] / 3600.0
     if kind in ("rate", "mean"):

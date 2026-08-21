@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
-from neu_oldenlabs.metrics import add_time_fields, daily, drop_habituation
+from neu_oldenlabs.metrics import add_time_fields, daily, drop_habituation, restrict_window
 
 
 def frame(rows):
@@ -94,3 +95,56 @@ def test_habituation_drops_the_first_calendar_days_per_cage():
     cage2_dates = [str(d) for d in kept[kept["cage"] == 2]["date"]]
     assert cage1_dates == ["2026-07-13", "2026-07-14"]
     assert cage2_dates == ["2026-07-22", "2026-07-23"]
+
+
+def test_restrict_window_keeps_only_dates_inside_the_bounds():
+    table = pd.DataFrame({
+        "cage": [1, 1, 1, 1],
+        "date": [pd.Timestamp("2026-07-10").date(), pd.Timestamp("2026-07-11").date(),
+                 pd.Timestamp("2026-07-12").date(), pd.Timestamp("2026-07-13").date()],
+        "value": [1.0, 2.0, 3.0, 4.0],
+    })
+    windowed = restrict_window(table, start="2026-07-11", end="2026-07-12")
+    assert [str(d) for d in windowed["date"]] == ["2026-07-11", "2026-07-12"]
+
+    only_start = restrict_window(table, start="2026-07-12", end=None)
+    assert [str(d) for d in only_start["date"]] == ["2026-07-12", "2026-07-13"]
+
+    only_end = restrict_window(table, start=None, end="2026-07-11")
+    assert [str(d) for d in only_end["date"]] == ["2026-07-10", "2026-07-11"]
+
+    unrestricted = restrict_window(table, start=None, end=None)
+    assert len(unrestricted) == 4
+
+
+def test_a_group_missing_every_value_aggregates_to_nan_not_zero():
+    # cage 58627's real tag 4 is NaN in 1075 of 1076 hours; pandas sums an
+    # all-NaN group to 0.0, a hard, plausible number that would silently pass
+    # min_days and enter the group comparison as a real observation.
+    long = frame([
+        (1, 4, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 10), 600.0,
+         "distance_cm", np.nan),
+        (1, 4, datetime(2026, 7, 11, 20, 10), datetime(2026, 7, 11, 20, 20), 600.0,
+         "distance_cm", np.nan),
+    ])
+    table = daily(long)
+    value = table[(table["phase"] == "all") & (table["measure"] == "distance_cm")]["value"]
+    assert len(value) == 1
+    assert np.isnan(value.iloc[0])
+
+
+def test_missing_values_are_excluded_from_the_duration_weight_not_just_the_numerator():
+    # 60 for one nine-minute bin, missing for an eleven-minute bin. The old
+    # code summed BOTH bins' duration into the denominator while only the
+    # present bin's value entered the numerator, deflating the mean: naive
+    # (60*540 + 0*660) / (540+660) = 27.0. The honest duration-weighted mean
+    # over only the present bin is 60.0 (its own duration cancels).
+    long = frame([
+        (1, 1, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 9), 540.0,
+         "inactive_pct", 60.0),
+        (1, 1, datetime(2026, 7, 11, 20, 9), datetime(2026, 7, 11, 20, 20), 660.0,
+         "inactive_pct", np.nan),
+    ])
+    table = daily(long)
+    value = table[(table["phase"] == "all") & (table["measure"] == "inactive_pct")]["value"]
+    assert round(float(value.iloc[0]), 6) == 60.0

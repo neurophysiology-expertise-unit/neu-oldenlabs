@@ -22,6 +22,8 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 
+from . import __version__
+
 MEASURES = {
     "Aggression time (%):": "aggression_time_pct",
     "Number of agression events (1/0):": "aggression_events",
@@ -113,6 +115,12 @@ def load_cage(path: Path, cage: int) -> pd.DataFrame:
     for row in rows:
         if row[0] is None:
             continue
+        if row[1] is None:
+            raise ValueError(
+                f"{path}: bin starting {row[0]} has a blank 'Datetime to' (bin_end); "
+                f"a missing bin_end silently drops out of the duration weighting while "
+                f"the bin's value stays in the total, inflating count-per-hour rates"
+            )
         starts.append(row[0])
         ends.append(row[1])
         for key in keys:
@@ -137,10 +145,16 @@ def load_cage(path: Path, cage: int) -> pd.DataFrame:
 
 
 def load_cage_cached(path: Path, cage: int, cache_dir: Path | None = None) -> pd.DataFrame:
-    """Parquet-cache the parse, keyed by the export's content hash.
+    """Parquet-cache the parse, keyed by the export's content hash AND package version.
 
     The reference export is 29 MB of XML and takes long enough that an
-    interactive re-run would otherwise pay for it every time.
+    interactive re-run would otherwise pay for it every time. The package
+    version is part of the key: a fix to the parsing logic (e.g. how missing
+    values are handled) changes what `load_cage` returns for the SAME input
+    bytes, and a stale cache keyed on content alone would silently keep
+    serving the old, buggy parse while `provenance.json` stamps the new
+    version -- a `version` mismatch that provenance could never catch because
+    it never sees the cache.
     """
     if cache_dir is None:
         return load_cage(path, cage)
@@ -148,7 +162,7 @@ def load_cage_cached(path: Path, cage: int, cache_dir: Path | None = None) -> pd
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached = cache_dir / f"cage{cage}_{sha256(path)[:16]}.parquet"
+    cached = cache_dir / f"cage{cage}_{__version__}_{sha256(path)[:16]}.parquet"
     if cached.exists():
         return pd.read_parquet(cached)
     frame = load_cage(path, cage)

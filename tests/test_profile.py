@@ -117,6 +117,27 @@ def test_duplicate_cage_tag_row_still_raises():
         build_profile(daily, circadian_table(cage=1, tag=1), duplicated_animals)
 
 
+def test_all_missing_days_do_not_count_toward_min_days():
+    # 3 real days plus 2 days where EVERY "all"-phase measure is NaN (a dead
+    # recording day, e.g. the sensor down for the whole day). Before the fix,
+    # those NaN-value rows still counted toward n_days via a plain nunique on
+    # "date", so this animal would clear min_days=5 on 3 real days plus 2
+    # days that carry no information at all.
+    rows = []
+    for offset in range(3):
+        date = (pd.Timestamp("2026-07-13") + pd.Timedelta(days=offset)).date()
+        rows.append({"cage": 1, "tag": 1, "date": date, "phase": "all",
+                     "measure": "distance_cm", "value": 100.0, "valid_hours": 24.0})
+    for offset in range(3, 5):
+        date = (pd.Timestamp("2026-07-13") + pd.Timedelta(days=offset)).date()
+        rows.append({"cage": 1, "tag": 1, "date": date, "phase": "all",
+                     "measure": "distance_cm", "value": np.nan, "valid_hours": 24.0})
+    daily = pd.DataFrame(rows)
+    row = build_profile(daily, circadian_table(), animal_table(), min_days=5).iloc[0]
+    assert row["n_days"] == 3
+    assert np.isnan(row["distance_cm_all"])
+
+
 def test_missing_n_days_counts_as_zero_and_still_triggers_blanking():
     # This animal has only "light"/"dark" rows, no "all"-phase rows, so day_counts
     # has no entry for it at all -- n_days must land as 0, not NaN, so the

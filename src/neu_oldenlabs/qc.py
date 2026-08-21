@@ -55,13 +55,31 @@ def bin_regularity(long: pd.DataFrame) -> pd.DataFrame:
             .size().rename(columns={"size": "bins"}))
 
 
-def recording_breaks(long: pd.DataFrame, threshold_min: float = 15.0) -> pd.DataFrame:
+def recording_breaks(long: pd.DataFrame, threshold_min: float | None = None,
+                     factor: float = 1.5) -> pd.DataFrame:
+    """Flag start-to-start gaps that exceed a threshold, per cage.
+
+    ``threshold_min=None`` (the default) makes the threshold RELATIVE to each
+    cage's own bin width: a gap counts as a break only once it exceeds
+    ``factor`` times that cage's median bin duration. A fixed absolute
+    threshold (the previous behaviour) does not generalise across a study
+    with more than one bin width -- a hardcoded 15-minute threshold flags
+    EVERY gap in an hourly-binned cage (its normal 60-minute cadence is
+    already 4x over 15 minutes), drowning real breaks in false positives.
+    Pass an explicit ``threshold_min`` to keep the old fixed-threshold
+    behaviour for a single known bin width.
+    """
     rows = []
     for cage, frame in long.drop_duplicates(subset=["cage", "bin_start"]).groupby("cage"):
         ordered = frame.sort_values("bin_start")
         gap = (ordered["bin_start"].shift(-1) - ordered["bin_start"]).dt.total_seconds() / 60
+        if threshold_min is None:
+            bin_minutes = ordered["duration_s"] / 60.0
+            cage_threshold = float(bin_minutes.median()) * factor if not bin_minutes.empty else 15.0
+        else:
+            cage_threshold = threshold_min
         flagged = ordered.assign(gap_min=gap)
-        flagged = flagged[flagged["gap_min"] > threshold_min]
+        flagged = flagged[flagged["gap_min"] > cage_threshold]
         for _, row in flagged.iterrows():
             rows.append({"cage": cage, "after_bin": row["bin_start"],
                          "gap_min": float(row["gap_min"])})
@@ -91,8 +109,27 @@ def range_violations(long: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["cage", "tag", "measure", "rule", "n_violations"])
 
 
+def missing_values(long: pd.DataFrame) -> pd.DataFrame:
+    """Per (cage, tag, measure): how many bins have a missing value, and what fraction.
+
+    ``io.load_cage`` coerces a malformed cell (a literal ``'NaN'`` string, for
+    example) to NaN with ``errors="coerce"``, silently. Nothing else in QC can
+    see this: ``range_violations`` cannot flag a NaN (a NaN comparison is
+    False), and ``coverage`` counts the bin as valid because the rack mask
+    only cares about ``in_rack``, not about the measure's own value. This is
+    the audit that makes a silently-coerced value visible, so a cage/tag/
+    measure that is missing in every bin -- which would otherwise average to
+    an invisible NaN (or, before the aggregation fix, an indistinguishable-
+    from-real 0.0) -- is named explicitly instead.
+    """
+    grouped = long.groupby(["cage", "tag", "measure"], as_index=False).agg(
+        bins=("value", "size"), missing=("value", lambda v: int(v.isna().sum())))
+    grouped["fraction_missing"] = grouped["missing"] / grouped["bins"]
+    return grouped
+
+
 def qc_tables(long: pd.DataFrame) -> dict[str, pd.DataFrame]:
     masked = apply_rack_mask(long)
     return {"rack": rack_summary(long), "regularity": bin_regularity(long),
             "breaks": recording_breaks(long), "coverage": coverage(masked),
-            "ranges": range_violations(long)}
+            "ranges": range_violations(long), "missing": missing_values(long)}

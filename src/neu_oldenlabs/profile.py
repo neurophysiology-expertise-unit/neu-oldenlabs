@@ -68,7 +68,15 @@ def build_profile(daily_table: pd.DataFrame, circadian_table: pd.DataFrame,
              .pivot(index=["cage", "tag"], columns="column", values="value"))
     means.columns.name = None
 
-    day_counts = (daily_table[daily_table["phase"] == "all"]
+    # A day only counts toward `n_days` if at least one "all"-phase measure has
+    # a real (non-NaN) value that day. Without the `value.notna()` filter, a
+    # calendar day where every measure was missing for the whole day (e.g. a
+    # sensor dead for an animal's entire recording, see metrics._aggregate_measure)
+    # still produced a row -- with value now correctly NaN rather than a fabricated
+    # 0.0 -- and would still count as a "day of data" here, letting the min_days
+    # guard below be satisfied by days that contain no information at all.
+    has_data = daily_table["phase"].eq("all") & daily_table["value"].notna()
+    day_counts = (daily_table[has_data]
                   .groupby(["cage", "tag"])["date"].nunique().rename("n_days"))
 
     distance = daily_table[(daily_table["measure"] == "distance_cm")

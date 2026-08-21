@@ -6,8 +6,8 @@ import pandas as pd
 import pytest
 
 from neu_oldenlabs.io import load_cage
-from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, range_violations,
-                              recording_breaks, rack_summary, valid_bins)
+from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, missing_values,
+                              range_violations, recording_breaks, rack_summary, valid_bins)
 
 
 def out_of_rack_in_bin_two(measure, tag, index):
@@ -91,6 +91,53 @@ def test_valid_bins_raises_when_in_rack_measure_missing(make_workbook):
 
     with pytest.raises(ValueError, match="no 'in_rack' measure"):
         valid_bins(long_without_rack)
+
+
+def test_missing_values_reports_the_fraction_missing_per_cage_tag_measure(make_workbook):
+    def one_missing(measure, tag, index):
+        if measure == "Total distance traveled (cm):" and index == 1:
+            return "NaN"
+        return 5.0
+
+    path = make_workbook(tags=(1,), bins=4, values=one_missing)
+    long = load_cage(path, 58616)
+    missing = missing_values(long)
+    row = missing[missing["measure"] == "distance_cm"].iloc[0]
+    assert row["bins"] == 4
+    assert row["missing"] == 1
+    assert round(row["fraction_missing"], 6) == 0.25
+    # A measure with no missing values still gets a row, at fraction 0.
+    other = missing[missing["measure"] == "accel_cm_s"].iloc[0]
+    assert other["missing"] == 0
+    assert other["fraction_missing"] == 0.0
+
+
+def test_missing_values_reports_a_fully_missing_measure(make_workbook):
+    def all_missing_one_measure(measure, tag, index):
+        if measure == "Total distance traveled (cm):":
+            return "NaN"
+        return 5.0
+
+    path = make_workbook(tags=(1,), bins=3, values=all_missing_one_measure)
+    long = load_cage(path, 58616)
+    row = missing_values(long).set_index("measure").loc["distance_cm"]
+    assert row["missing"] == row["bins"] == 3
+    assert row["fraction_missing"] == 1.0
+
+
+def test_recording_breaks_threshold_scales_with_the_cages_own_bin_width(make_workbook):
+    # An hourly-binned cage's normal 60-minute cadence must not itself be
+    # flagged as a break just because it exceeds a fixed 15-minute default --
+    # the threshold must be relative to the cage's own bin width.
+    hourly = make_workbook(tags=(1,), bins=4, minutes=(60,))
+    breaks = recording_breaks(load_cage(hourly, 58616))
+    assert breaks.empty
+
+    # A gap that is a large multiple of the cage's own cadence is still flagged.
+    hourly_with_break = make_workbook(tags=(1,), bins=3, minutes=(60, 300, 60))
+    breaks = recording_breaks(load_cage(hourly_with_break, 58616))
+    assert len(breaks) == 1
+    assert breaks.iloc[0]["gap_min"] == 300.0
 
 
 def test_apply_rack_mask_raises_on_structurally_missing_rack_status(make_workbook):
