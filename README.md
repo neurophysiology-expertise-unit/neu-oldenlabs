@@ -80,8 +80,10 @@ RNG seed; `ingest` only writes the parsed Parquet table (`cage<id>.parquet`).
 
 `study.json` declares the cage list with export paths (or `null` for an export that has
 not arrived yet), the animal/genotype CSV path, the analysis window, habituation days,
-light schedule, the pre-specified primary measure set, and the full scan measure list.
-See `docs/superpowers/specs/2026-08-20-neu-oldenlabs-design.md` §9 for the schema.
+light schedule, the pre-specified primary measure set, the full scan measure list, and
+the optional `resample_bin_s` common bin width (integer seconds, or `null`/omitted for
+no resampling). See `docs/superpowers/specs/2026-08-20-neu-oldenlabs-design.md` §9 for
+the schema and §6.0 for what `resample_bin_s` does.
 
 `report.py` renders its tables by hand rather than via `DataFrame.to_markdown()`,
 which needs the optional `tabulate` package that is not a declared dependency of this
@@ -148,6 +150,26 @@ exactly this case: five wildtype animals and no mutants.
   arrived is declared with a null export in `study.json`, is never analysed as a
   genotype comparison, and is named explicitly in the report's Data and coverage
   section.
+- **The animal CSV is the sole authority on which animals exist.** A `(cage, tag)`
+  present in an export but not listed in the animal CSV is not a tracked animal —
+  it may be an animal removed from the cage, or one whose ear tag was lost and its
+  slot re-used — and is excluded from all analysis (profile, statistics, figures)
+  regardless of how much data it carries. It does not raise, and it does not vanish
+  silently: it is named in the QC panel figure, written to `qc_excluded_tags.csv`
+  (`cage, tag, bins, present_bins, missing_fraction`), and stated in the report's
+  Quality control section. The real study carries three such tags, each ~99.9%
+  empty: cage 58597 tag 3, cage 58627 tag 4, cage 62923 tag 1. The reverse
+  direction — a tag the CSV lists for a cage but which the export lacks — is a
+  genuine discrepancy and still raises (`animals.check_join`).
+- **A study can be resampled to one common bin width.** The real study mixes cage
+  58616's 600 s (10-minute) bins with the other five cages' 3600 s (hourly) bins.
+  Setting `resample_bin_s` (the real study uses `3600`) re-bins every cage's data
+  to that common, clock-aligned width before any metric is computed
+  (`metrics.resample_bins`), duration-weighted and presence-aware exactly like
+  every other aggregation step in this package: a target bin with no present
+  source bin is `NaN`, never `0.0`. The report states the target width and which
+  cages' native width actually differed from it (i.e. were genuinely re-binned,
+  not just passed through as a no-op).
 
 ## Privacy
 

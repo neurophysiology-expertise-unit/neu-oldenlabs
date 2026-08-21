@@ -82,8 +82,30 @@ tag date, monitoring start. Cage number appears only on the first row of each
 block and is forward-filled.
 
 **Join key is `(cage, tag)`** — tag # in the CSV is the `Animal ID` in the export.
-The join must be exact and total: every populated tag column in an export needs
-exactly one CSV row and vice versa, or the run fails.
+The join is **asymmetric**, per the study owner's ruling that the animal CSV is
+the sole authority on which animals exist ("if the slot is not defined in csv
+then it should not exist. Sometimes I can have animals that can be taken from
+the cage or animals ear tag can be slipped over and buried to the ground but
+these animals we can sometimes have some proper data at some point, we just
+keep them separate from group analysis for sure, phantom lists should not be
+taken into account"):
+
+- A tag the CSV lists for a cage but which is **absent from that cage's
+  export** is a genuine discrepancy — the study is missing that animal's
+  entire record — and the run **fails** (`animals.check_join`).
+- A tag present in an export but **not listed in the CSV** is not a tracked
+  animal — an animal removed from the cage, or one whose ear tag was lost and
+  its slot re-used, are both plausible causes — and is **excluded from all
+  analysis** (profile, statistics, figures) regardless of how much data it
+  carries, however it does **not** fail the run. It is reported instead: a QC
+  table (`qc.excluded_tag_table`, `cage, tag, bins, present_bins,
+  missing_fraction`) names every excluded tag, is written as
+  `qc_excluded_tags.csv`, appears in the QC panel figure, and is stated in the
+  report's Quality control section. The real study carries three such tags,
+  each ~99.9% empty: cage 58597 tag 3, cage 58627 tag 4, cage 62923 tag 1.
+
+So the join is exact and total only in the CSV-lists-it direction; an
+export-only tag is a reported exclusion, not a failure.
 
 **Genotype normalisation.** The CSV contains three spellings: `W/w` (14),
 `Mut/W` (10), `W/W` (1 — animal 672, cage 58623). Per the study owner, `W/w` and
@@ -178,6 +200,37 @@ Report-only; QC never modifies inputs and never repairs values.
   Violations are reported per cage, never auto-corrected.
 
 ## 6. Metrics
+
+### 6.0 Resampling to a common bin width
+
+Cage 58616's export bins at 600 s (10 minutes); the other five cages bin at
+3600 s (hourly). Per the study owner ("downsample minutely to hourly, we can
+keep the analysis to hourly at this moment and if needed in the future I can
+download the minutely data but I do not think it is going to be needed"), the
+study configuration carries an optional `resample_bin_s` key (integer seconds,
+or `null` for no resampling; the real study sets it to `3600`). When set,
+`metrics.resample_bins` re-bins every cage's long frame to that common,
+clock-aligned width **before any metric is computed** — daily aggregation, the
+circadian family, and every figure all then see one resolution, whatever the
+export's native width was.
+
+The re-binning rule mirrors `metrics._aggregate_measure`'s duration-weighted,
+presence-aware aggregation exactly: `rate`/`mean` → duration-weighted mean,
+`max` → maximum, `count` → sum, grouped by `io.MEASURE_KIND`. The duration
+weight for a target bin counts only source bins whose value is present, so a
+target bin with no present source bin is `NaN`, never `0.0`; the output
+`duration_s` is the summed present source duration. Resampling a frame already
+at the target width is a no-op in value terms.
+
+Pipeline ordering: QC tables run on the raw, native-bin frame (so bin-width
+reporting and the missing-value audit describe what actually arrived); the
+rack mask is applied next, on native bins; resampling runs after the mask, so
+the `in_rack` mask itself is never resampled — it has already done its job and
+no longer exists in the frame by that point. Only then do daily aggregation
+and the circadian profile run. The report states the resampling when it is in
+effect: the target width, and which cages' native width actually differed
+from it (a cage already at the target width is technically resampled too, but
+that is a no-op, so it is not named as "re-binned").
 
 ### 6.1 Daily aggregation
 
@@ -312,7 +365,8 @@ parameters, and the RNG seed.
 `study.json` (in `neubrain/projects/oldenlabs/analysis/experiments/dacruz_study2/`)
 declares: cage list with export paths, animal CSV path, analysis window,
 habituation days, light schedule, genotype group definitions, the primary measure
-set, and the full scan measure list.
+set, the full scan measure list, and the optional `resample_bin_s` common bin
+width (§6.0) — `3600` for the real study.
 
 ## 10. Testing
 
