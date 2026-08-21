@@ -44,10 +44,12 @@ def _format_cell(value) -> str:
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, float):
-        return "" if pd.isna(value) else f"{value:.4g}"
-    if value is None:
-        return ""
-    return str(value)
+        text = "n/a" if pd.isna(value) else f"{value:.4g}"
+    elif value is None:
+        text = "n/a"
+    else:
+        text = str(value)
+    return text.replace("|", "\\|")
 
 
 def _markdown_table(frame: pd.DataFrame, columns: list[str] | None = None) -> str:
@@ -124,9 +126,9 @@ def _count_kind_sentence(per_hour: list[str]) -> str:
                 "aggregation rule (rate per valid hour).")
     base = (
         f"Per the export's aggregation rule (`io.MEASURE_KIND`), these measures are "
-        f"COUNTS: their `_all`/`_light`/`_dark` profile columns are totals divided by "
-        f"the cage's valid hours in that window, i.e. a rate PER VALID HOUR, not per "
-        f"day: {', '.join(per_hour)}.")
+        f"summed over bins and expressed as a rate PER VALID HOUR, not per day -- "
+        f"their `_all`/`_light`/`_dark` profile columns are the bin total divided by "
+        f"the cage's valid hours in that window: {', '.join(per_hour)}.")
     if "aggression_events" in per_hour:
         base += (" In particular, `aggression_events_all` is events per hour, "
                  "NOT per day.")
@@ -229,7 +231,7 @@ def _methods(study: StudyConfig, result: dict) -> str:
 _COMPARE_DISPLAY_COLUMNS = [
     "measure", "n_mut", "n_wt", "cages_contributing", "difference", "ci_low", "ci_high",
     "hedges_g", "p_value", "min_attainable_p", "assignments", "p_adjusted_bh",
-    "lmm_coefficient", "lmm_p_value", "lmm_converged",
+    "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
 ]
 
 
@@ -237,7 +239,9 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
     scan = result["scan"]
     lines = ["## Results", ""]
 
-    if "measure" not in scan.columns or scan.empty:
+    if "note" in scan.columns:
+        # `pipeline.run_study`'s own skip path: no loaded cage contains both
+        # genotypes at all, so `groups.scan` was never called (see `run_study`).
         note = scan.attrs.get("note", "no loaded cage contains both genotypes; "
                                       "group comparison skipped")
         lines += [
@@ -246,6 +250,23 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
             "This is an expected RESULT for a single-genotype cage, not an error -- "
             "see Interpretation safeguards below for which cage(s) this applies to. "
             "Only descriptive tables and figures follow.",
+            "",
+        ]
+    elif "measure" in scan.columns and scan.empty:
+        # `groups.scan` itself ran (cages ARE genotype-mixed) but every measure was
+        # individually skipped -- constant, absent, or no contributing cage. The
+        # real reason lives in `scan.attrs["skipped_measures"]`, not in a "no cage
+        # has both genotypes" fallback, which would be false here.
+        skipped = scan.attrs.get("skipped_measures", [])
+        reason = ("; ".join(skipped) if skipped
+                 else "every candidate measure was skipped for an unrecorded reason")
+        lines += [
+            f"No genotype comparison was computed: {reason}.",
+            "",
+            "At least one loaded cage does contain both genotypes; every candidate "
+            "measure was individually dropped by the scan (see the reason above), "
+            "not because no comparison was possible. Only descriptive tables and "
+            "figures follow.",
             "",
         ]
     else:
@@ -277,33 +298,75 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
     return "\n".join(lines)
 
 
+def _cage_weights(profile: pd.DataFrame) -> pd.DataFrame | None:
+    """The per-cage mut/wt composition, via `groups.cage_weights`, or None if empty.
+
+    Uses a dummy `value` column of 1.0 (never NaN) rather than any specific
+    measure's values, so the composition it reports reflects the animal table's
+    true genotype composition -- not one measure's missing-data pattern.
+    """
+    if profile.empty:
+        return None
+    composition = profile[["cage", "genotype"]].copy()
+    composition["value"] = 1.0
+    return groups.cage_weights(composition)
+
+
+def _zero_weight_sentence(weights: pd.DataFrame | None) -> str:
+    if weights is None:
+        return "No animals were loaded, so no cage composition can be described."
+    zero = weights[weights["weight"] <= 0]
+    if zero.empty:
+        return ("Every loaded cage houses both genotypes and contributes a "
+                "within-cage contrast to the comparison; no cage drops out "
+                "by construction in this run.")
+    parts = [f"cage {int(row.cage)} ({int(row.n_mut)} mut / {int(row.n_wt)} wt)"
+             for row in zero.itertuples()]
+    plural = len(parts) > 1
+    noun = "cages" if plural else "cage"
+    verb = "house" if plural else "houses"
+    contribute = "contribute" if plural else "contributes"
+    pronoun = "Each" if plural else "It"
+    return (
+        f"The following {noun} {verb} a single genotype and therefore {contribute} "
+        f"NO within-cage contrast: {', '.join(parts)}. Weight is zero and "
+        f"{pronoun.lower()} drops out of the genotype comparison by construction "
+        f"rather than silently shifting a mean; its animals still appear in every "
+        f"descriptive table and figure above.")
+
+
+def _dyadic_composition_clause(weights: pd.DataFrame | None) -> str:
+    """Describe this run's actual cage composition, read off `groups.cage_weights`.
+
+    The dyadic caveat itself is a fixed methodological fact and stays fixed; only
+    its claims ABOUT THIS RUN's cages -- whether any cage is genotype-mixed, and
+    how composition varies -- are generated from the profile, so they cannot
+    contradict the zero-weight-cage sentence above or assert a mutant exists when
+    none was loaded.
+    """
+    if weights is None:
+        return "No animals were loaded, so cage composition cannot be described."
+    parts = [f"cage {int(row.cage)} ({int(row.n_mut)} mut / {int(row.n_wt)} wt)"
+             for row in weights.itertuples()]
+    composition_line = "; ".join(parts)
+    if int(weights["n_mut"].sum()) == 0:
+        return (f"In this run every loaded cage is single-genotype wildtype "
+                f"({composition_line}), so this dependence does not act on any "
+                f"animal in the current data -- it applies as soon as a "
+                f"mutant-carrying cage is loaded.")
+    distinct = {(int(row.n_mut), int(row.n_wt)) for row in weights.itertuples()}
+    if len(distinct) == 1:
+        return f"In this run every loaded cage shares the same composition ({composition_line})."
+    return f"In this run, cage composition varies across cages: {composition_line}."
+
+
 def _safeguards(study: StudyConfig, result: dict) -> str:
     profile = result["profile"]
     scan = result["scan"]
+    weights = _cage_weights(profile)
 
-    if profile.empty:
-        zero_weight_line = "No animals were loaded, so no cage composition can be described."
-    else:
-        composition = profile[["cage", "genotype"]].copy()
-        composition["value"] = 1.0
-        weights = groups.cage_weights(composition)
-        zero = weights[weights["weight"] <= 0]
-        if zero.empty:
-            zero_weight_line = ("Every loaded cage houses both genotypes and contributes a "
-                                "within-cage contrast to the comparison; no cage drops out "
-                                "by construction in this run.")
-        else:
-            parts = [f"cage {int(row.cage)} ({int(row.n_mut)} mut / {int(row.n_wt)} wt)"
-                     for row in zero.itertuples()]
-            plural = len(parts) > 1
-            noun = "cages" if plural else "cage"
-            verb = "house" if plural else "houses"
-            zero_weight_line = (
-                f"The following {noun} {verb} a single genotype and therefore contribute "
-                f"NO within-cage contrast: {', '.join(parts)}. Weight is zero and "
-                f"each drops out of the genotype comparison by construction rather than "
-                f"silently shifting a mean; its animals still appear in every descriptive "
-                f"table and figure above.")
+    zero_weight_line = _zero_weight_sentence(weights)
+    composition_clause = _dyadic_composition_clause(weights)
 
     fdr_line = ("The full scan is FDR-corrected (Benjamini-Hochberg, `p_adjusted_bh`) and "
                "is HYPOTHESIS-GENERATING: it is a screen across candidate measures, not a "
@@ -318,13 +381,13 @@ def _safeguards(study: StudyConfig, result: dict) -> str:
         "",
         f"- **Cages with no within-cage contrast.** {zero_weight_line}",
         "",
-        "- **Social distance and aggression are DYADIC, not per-animal.** A mutant's "
-        "social distance or aggression rate depends on which genotypes its cage-mates "
-        "carry, and cage composition varies across cages in this study -- some are "
-        "genotype-mixed, some are not. Within-cage permutation is the correct test "
-        "precisely because of this dyadic dependence: it compares each animal only "
-        "against its own cage-mates, never against an animal in a differently-composed "
-        "cage.",
+        "- **Social distance and aggression are DYADIC, not per-animal.** Social "
+        "distance and aggression are properties of a dyad, not of a single animal: "
+        "an animal's value depends on which genotypes its cage-mates carry, not on "
+        f"its own genotype alone. {composition_clause} Within-cage permutation is "
+        "the correct test precisely because of this dyadic dependence: it compares "
+        "each animal only against its own cage-mates, never against an animal in a "
+        "differently-composed cage.",
         "",
         f"- **Non-significant results.** {fdr_line} A non-significant result -- for a "
         "primary measure or a scanned one -- is reported as absence of evidence, "

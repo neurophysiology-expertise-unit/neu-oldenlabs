@@ -53,8 +53,9 @@ scripts/render_report.sh <dir>
 
 All of `qc`/`profile`/`compare`/`study-report` accept `--cache <dir>` to Parquet-cache
 the parsed export (keyed by content hash), so a re-run does not re-parse a multi-tens-of-MB
-`.xlsx` file. Every command writes `provenance.json` into its output directory, recording
-input paths and hashes, the package version, parameters, and the RNG seed.
+`.xlsx` file. Every command except `ingest` writes `provenance.json` into its output
+directory, recording input paths and hashes, the package version, parameters, and the
+RNG seed; `ingest` only writes the parsed Parquet table (`cage<id>.parquet`).
 
 `study.json` declares the cage list with export paths (or `null` for an export that has
 not arrived yet), the animal/genotype CSV path, the analysis window, habituation days,
@@ -86,9 +87,12 @@ exactly this case: five wildtype animals and no mutants.
   when the fully sign-flipped labelling (every contributing cage's mut/wt labels
   swapped) is itself one of the enumerated assignments, which requires every
   contributing cage to be genotype-balanced. The real study's contributing cages are
-  3/2, 3/2, 1/3, 1/1, and 2/2 — none balanced — so the floor is 1/n. The code
-  computes and reports the correct floor per measure as `min_attainable_p`; the
-  report always prints that returned value, never a literal 2/n.
+  3/2, 3/2, 1/3, 1/1, and 2/2: two of these (1/1 and 2/2) are individually balanced,
+  but the other three (3/2, 3/2, 1/3) are not, and the 2/n floor requires *every*
+  contributing cage to be balanced, not just some — so the floor for this design is
+  1/n, not 2/n. The code computes and reports the correct floor per measure as
+  `min_attainable_p`; the report always prints that returned value, never a
+  literal 2/n.
 - **Hedges' g is computed over contributing cages only**, using the stratified
   difference itself as its numerator, so the effect size describes the same
   quantity as the test. Its pooled standard deviation additionally drops any
