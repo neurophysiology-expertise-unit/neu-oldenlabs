@@ -6,8 +6,9 @@ import pandas as pd
 import pytest
 
 from neu_oldenlabs.io import load_cage
-from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, missing_values,
-                              range_violations, recording_breaks, rack_summary, valid_bins)
+from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, excluded_tag_table,
+                              missing_values, range_violations, recording_breaks, rack_summary,
+                              valid_bins)
 
 
 def out_of_rack_in_bin_two(measure, tag, index):
@@ -163,3 +164,50 @@ def test_apply_rack_mask_raises_on_structurally_missing_rack_status(make_workboo
 
     with pytest.raises(ValueError, match="bins with no rack status"):
         apply_rack_mask(long_with_orphan)
+
+
+def test_excluded_tag_table_reports_bins_present_and_missing_fraction(make_workbook):
+    def phantom(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        if tag == 9:
+            return 5.0 if index == 0 else "NaN"
+        return 5.0
+
+    path = make_workbook(tags=(1, 9), bins=4, values=phantom)
+    long = load_cage(path, 58616)
+    table = excluded_tag_table(long, [(58616, 9)])
+    assert list(table.columns) == ["cage", "tag", "bins", "present_bins", "missing_fraction"]
+    row = table.iloc[0]
+    assert (row["cage"], row["tag"]) == (58616, 9)
+    assert row["bins"] == 4
+    assert row["present_bins"] == 1
+    assert round(row["missing_fraction"], 6) == 0.75
+
+
+def test_excluded_tag_table_ignores_the_in_rack_mask_for_presence(make_workbook):
+    # in_rack is a cage-state signal, not animal data -- an excluded tag whose
+    # in_rack reading is always present but every real measure is missing must
+    # still be reported as fully missing, not as 0% missing.
+    def phantom_but_in_rack_present(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        if tag == 9:
+            return "NaN"
+        return 5.0
+
+    path = make_workbook(tags=(1, 9), bins=3, values=phantom_but_in_rack_present)
+    long = load_cage(path, 58616)
+    table = excluded_tag_table(long, [(58616, 9)])
+    row = table.iloc[0]
+    assert row["bins"] == 3
+    assert row["present_bins"] == 0
+    assert row["missing_fraction"] == 1.0
+
+
+def test_excluded_tag_table_is_empty_when_nothing_is_excluded(make_workbook):
+    path = make_workbook(tags=(1,), bins=2)
+    long = load_cage(path, 58616)
+    table = excluded_tag_table(long, [])
+    assert table.empty
+    assert list(table.columns) == ["cage", "tag", "bins", "present_bins", "missing_fraction"]

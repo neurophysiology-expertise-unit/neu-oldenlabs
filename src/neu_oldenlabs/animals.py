@@ -44,18 +44,31 @@ def load_animals(csv_path: Path) -> pd.DataFrame:
     return table[["cage", "animal_number", "ear_mark", "genotype_raw", "genotype", "tag"]]
 
 
-def check_join(table: pd.DataFrame, cage: int, tags: set[int]) -> None:
-    """Fail unless the export's tags and the animal table's tags match exactly.
+def check_join(table: pd.DataFrame, cage: int, tags: set[int]) -> list[int]:
+    """Reconcile one cage's export tags against the animal table. The join is
+    deliberately ASYMMETRIC, per the study owner's ruling that the animal CSV
+    is the sole authority on which animals exist: "if the slot is not defined
+    in csv then it should not exist."
 
-    A partial join would silently analyse fewer animals than the study contains,
-    which is the one failure mode that never announces itself in a figure.
+    - A tag present in the export but NOT listed in the CSV is not a tracked
+      animal -- it may be an animal removed from the cage, or one whose ear tag
+      was lost and its slot re-used -- and is returned here as an EXCLUDED tag
+      rather than raised on, however much data it carries. The caller must keep
+      it out of every downstream analysis (profile, statistics, figures) and
+      report it rather than let it vanish silently (see
+      `qc.excluded_tag_table`).
+    - A tag the CSV LISTS for this cage but which never appears in the export
+      is still a genuine discrepancy -- the study is missing that animal's
+      entire record -- and this direction still RAISES. Silently analysing
+      fewer animals than the study contains is the one failure mode that never
+      announces itself in a figure.
+
+    Returns the sorted list of excluded (export-only) tags.
     """
     listed = set(table.loc[table["cage"] == cage, "tag"].tolist())
     if not listed:
         raise ValueError(f"cage {cage} has no animals in the animal table")
-    extra = sorted(tags - listed)
-    if extra:
-        raise ValueError(f"cage {cage}: tags only in export, not in animal table: {extra}")
     absent = sorted(listed - tags)
     if absent:
         raise ValueError(f"cage {cage}: tags only in animal table, not in export: {absent}")
+    return sorted(tags - listed)

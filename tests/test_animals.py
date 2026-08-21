@@ -47,10 +47,21 @@ def test_duplicate_tag_within_a_cage_raises(tmp_path):
         load_animals(write_csv(tmp_path, bad))
 
 
-def test_check_join_requires_identical_tag_sets(tmp_path):
+def test_check_join_returns_export_only_tags_instead_of_raising(tmp_path):
+    # The join is asymmetric (study owner's ruling: the CSV is the sole
+    # authority on which animals exist). A tag only in the export -- not
+    # listed in the CSV -- is not a real failure: it is returned as an
+    # excluded tag for the caller to keep out of analysis and report,
+    # never raised on. This replaces the old symmetric rule, under which
+    # this same call used to raise "only in export".
     table = load_animals(write_csv(tmp_path))
-    check_join(table, 58616, {2, 5})
-    with pytest.raises(ValueError, match="only in export"):
-        check_join(table, 58616, {2, 5, 9})
+    assert check_join(table, 58616, {2, 5}) == []
+    assert check_join(table, 58616, {2, 5, 9}) == [9]
+
+
+def test_check_join_still_raises_when_a_csv_listed_animal_is_absent_from_export(tmp_path):
+    # The reverse direction is a genuine discrepancy -- the study is missing
+    # an animal's entire record -- and remains fatal.
+    table = load_animals(write_csv(tmp_path))
     with pytest.raises(ValueError, match="only in animal table"):
         check_join(table, 58616, {2})

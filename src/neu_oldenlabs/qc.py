@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .io import PERCENT_MEASURES
+from .io import MEASURE_KIND, PERCENT_MEASURES
 
 
 def valid_bins(long: pd.DataFrame) -> pd.DataFrame:
@@ -126,6 +126,44 @@ def missing_values(long: pd.DataFrame) -> pd.DataFrame:
         bins=("value", "size"), missing=("value", lambda v: int(v.isna().sum())))
     grouped["fraction_missing"] = grouped["missing"] / grouped["bins"]
     return grouped
+
+
+def excluded_tag_table(long: pd.DataFrame, excluded: list[tuple[int, int]]) -> pd.DataFrame:
+    """Per (cage, tag) excluded by `animals.check_join`: how much data it carries.
+
+    A tag present in an export but not listed in the animal CSV is not a
+    tracked animal (the study owner's ruling -- see `animals.check_join`) and
+    never reaches `build_profile` or any other analysis, however much data it
+    carries. It must not vanish silently, so this reports, for each excluded
+    tag, how many bins it has and what fraction of those bins actually carry a
+    value -- typically ~99.9% missing for the real study's three phantom tags,
+    which is the evidence that these are stray slots (an animal removed from
+    the cage, or one whose ear tag was lost) rather than a parsing artefact.
+
+    ``long`` must be the UNFILTERED long frame (before excluded tags are
+    dropped) -- this is the one place their data is still read.
+
+    A bin counts as "present" for a tag if AT LEAST ONE of its non-mask
+    measures (everything except `in_rack`) has a non-missing value in that
+    bin. `in_rack` is excluded from the presence check because it describes
+    the cage's rack state, not the animal -- an excluded tag's slot can carry
+    a normal `in_rack` reading with no behavioural data behind it at all, and
+    counting that would understate how empty these tags actually are.
+    """
+    columns = ["cage", "tag", "bins", "present_bins", "missing_fraction"]
+    if not excluded:
+        return pd.DataFrame(columns=columns)
+    keys = pd.DataFrame(sorted(set(excluded)), columns=["cage", "tag"])
+    subset = long.merge(keys, on=["cage", "tag"], how="inner")
+    subset = subset[subset["measure"].map(MEASURE_KIND) != "mask"]
+    rows = []
+    for (cage, tag), block in subset.groupby(["cage", "tag"]):
+        bins = int(block["bin_start"].nunique())
+        present = int(block.loc[block["value"].notna(), "bin_start"].nunique())
+        missing_fraction = (1 - present / bins) if bins else float("nan")
+        rows.append({"cage": cage, "tag": tag, "bins": bins,
+                     "present_bins": present, "missing_fraction": missing_fraction})
+    return pd.DataFrame(rows, columns=columns)
 
 
 def qc_tables(long: pd.DataFrame) -> dict[str, pd.DataFrame]:
