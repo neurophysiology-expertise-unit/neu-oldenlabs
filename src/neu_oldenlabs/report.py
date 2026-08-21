@@ -37,9 +37,10 @@ _FIGURES = [
     ("daily_trajectories", "Daily trajectories: one line per animal across the "
                            "recording window, coloured by genotype."),
     ("qc_panel", "QC panel: rack-mask fraction, recording breaks, out-of-range "
-                "values, mean valid hours per day, and fraction of values "
-                "missing (NaN), one bar per cage; the title flags when bin "
-                "width varies across cages."),
+                "values, mean valid hours per day, fraction of values "
+                "missing (NaN), excluded tags, and non-finite in_rack bins, "
+                "one bar per cage; the title flags when bin width varies "
+                "across cages."),
 ]
 
 
@@ -173,9 +174,34 @@ def _quality_control(result: dict) -> str:
         lines += ["**Missing values.** No non-numeric values were found in any "
                  "loaded export.", ""]
 
+    lines += [_non_finite_rack_paragraph(result["qc"].get("rack_non_finite")), ""]
     lines += [_excluded_tags_paragraph(result["qc"].get("excluded_tags")), ""]
 
     return "\n".join(lines)
+
+
+def _non_finite_rack_paragraph(non_finite: pd.DataFrame | None) -> str:
+    """Name any cage/tag whose `in_rack` reading was non-finite (NaN, +-inf).
+
+    Controller ruling (see `qc.valid_bins`): such a bin is excluded from
+    analysis -- it is not evidence the cage was in the rack -- but must be
+    reported by name and kept separate from a genuine out-of-rack (0) bin,
+    never silently dropped and never folded into the out-of-rack fraction
+    above.
+    """
+    if non_finite is None or non_finite.empty:
+        return ("**Non-finite rack readings.** Every `in_rack` value in every "
+                "loaded export was finite; none were excluded on this basis.")
+    total = int(non_finite["n_non_finite_bins"].sum())
+    parts = [f"cage {int(row.cage)} tag {int(row.tag)} ({int(row.n_non_finite_bins)} bin(s))"
+             for row in non_finite.itertuples()]
+    return (
+        f"**Non-finite rack readings.** {total} bin(s) had a non-finite `in_rack` "
+        "value (NaN or +-inf) and were excluded from analysis -- not treated as "
+        "in-rack, and NOT counted in the out-of-rack fraction above (a different "
+        "failure mode, reported separately per the study owner's ruling): "
+        + "; ".join(parts) + ". See `qc_rack_non_finite.csv` for the full table."
+    )
 
 
 def _excluded_tags_paragraph(excluded: pd.DataFrame | None) -> str:

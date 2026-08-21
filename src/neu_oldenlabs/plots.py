@@ -381,11 +381,18 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
     cage that were present in the export but not listed in the animal CSV,
     and were therefore excluded from every other table and figure here --
     this panel is the one place their existence is visible in a figure.
+    `rack_non_finite` (from `qc.non_finite_rack`) counts bins per cage whose
+    `in_rack` reading was non-finite (NaN, +-inf) -- excluded from analysis
+    the same as an out-of-rack bin, but a different failure mode, so it is
+    plotted as its own panel rather than folded into
+    `mean_fraction_out_of_rack`.
     """
     rack, regularity, breaks, coverage, ranges, missing = (
         qc["rack"], qc["regularity"], qc["breaks"], qc["coverage"], qc["ranges"],
         qc["missing"])
     excluded = qc.get("excluded_tags", pd.DataFrame(columns=["cage", "tag"]))
+    non_finite = qc.get("rack_non_finite",
+                        pd.DataFrame(columns=["cage", "tag", "n_non_finite_bins"]))
 
     cages = sorted(rack["cage"].unique()) if not rack.empty else []
     fraction_out = (rack.groupby("cage")["fraction_out"].mean().reindex(cages).fillna(0.0))
@@ -400,6 +407,9 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
         .reindex(cages).fillna(0.0) if not missing.empty else pd.Series(0.0, index=cages))
     n_excluded = (excluded.groupby("cage").size().reindex(cages).fillna(0).astype(int)
                  if not excluded.empty else pd.Series(0, index=cages, dtype=int))
+    n_non_finite = (non_finite.groupby("cage")["n_non_finite_bins"].sum()
+                    .reindex(cages).fillna(0).astype(int)
+                    if not non_finite.empty else pd.Series(0, index=cages, dtype=int))
 
     bin_widths = {}
     if not regularity.empty:
@@ -415,16 +425,18 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
         "mean_valid_hours_per_day": valid_hours.to_numpy(),
         "mean_fraction_missing_values": fraction_missing.to_numpy(),
         "n_excluded_tags": n_excluded.to_numpy(),
+        "n_non_finite_rack_bins": n_non_finite.to_numpy(),
         "bin_width_s": [bin_width_label.get(cage, "") for cage in cages],
     })
 
-    fig, axes = plt.subplots(2, 3, figsize=(11.5, 6))
+    fig, axes = plt.subplots(2, 4, figsize=(15, 6))
     panels = [("mean_fraction_out_of_rack", "fraction of bins out of rack"),
              ("n_recording_breaks", "recording breaks (relative to cage's own bin width)"),
              ("n_range_violations", "out-of-range values"),
              ("mean_valid_hours_per_day", "mean valid hours / day"),
              ("mean_fraction_missing_values", "fraction of values missing (NaN)"),
-             ("n_excluded_tags", "tags excluded (not in animal CSV)")]
+             ("n_excluded_tags", "tags excluded (not in animal CSV)"),
+             ("n_non_finite_rack_bins", "non-finite in_rack bins (excluded, not out-of-rack)")]
     x = np.arange(len(cages))
     flat_axes = axes.flat
     for (column, title), ax in zip(panels, flat_axes):

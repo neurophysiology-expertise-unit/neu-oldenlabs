@@ -7,8 +7,8 @@ import pytest
 
 from neu_oldenlabs.io import load_cage
 from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, excluded_tag_table,
-                              missing_values, range_violations, recording_breaks, rack_summary,
-                              valid_bins)
+                              missing_values, non_finite_rack, qc_tables, range_violations,
+                              recording_breaks, rack_summary, valid_bins)
 
 
 def out_of_rack_in_bin_two(measure, tag, index):
@@ -68,18 +68,79 @@ def test_percentages_outside_zero_to_hundred_are_reported_not_corrected(make_wor
     assert long.loc[long["measure"] == "time_eating_pct", "value"].max() == 150.0
 
 
-def test_valid_bins_raises_on_non_finite_in_rack_value(make_workbook):
-    """Test that non-finite in_rack values (NaN, inf) cause a crash."""
+def test_valid_bins_excludes_non_finite_in_rack_values_instead_of_raising(make_workbook):
+    """A non-finite in_rack value is excluded from analysis, not fatal.
+
+    Controller ruling: the guard exists to stop such bins being SILENTLY
+    dropped, not to make them crash the whole run. So a non-finite reading
+    must come back marked invalid (never assumed "in rack") and flagged via
+    the ``non_finite`` column, distinct from a genuine 0 (out-of-rack).
+    """
     def nan_in_rack(measure, tag, index):
         if measure == "Cage in rack (1/0):":
-            return float('nan')
+            return float('nan') if index == 0 else 1.0
         return 5.0
 
     path = make_workbook(tags=(1,), bins=2, values=nan_in_rack)
     long = load_cage(path, 58616)
 
-    with pytest.raises(ValueError, match="non-finite in_rack values"):
-        valid_bins(long)
+    mask = valid_bins(long)
+    bad = mask[mask["non_finite"]]
+    assert len(bad) == 1
+    assert bool(bad.iloc[0]["valid"]) is False
+
+    good = mask[~mask["non_finite"]]
+    assert len(good) == 1
+    assert bool(good.iloc[0]["valid"]) is True
+
+
+def test_rack_summary_does_not_fold_non_finite_into_out_of_rack(make_workbook):
+    """The non-finite count must be reported separately, never merged into
+    ``bins_out_of_rack`` -- a NaN/inf rack reading is a different failure
+    mode from a genuine 0 and must not be disguised as one."""
+    def nan_and_zero(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return {0: float('nan'), 1: 0.0, 2: 1.0}[index]
+        return 5.0
+
+    path = make_workbook(tags=(1,), bins=3, values=nan_and_zero)
+    long = load_cage(path, 58616)
+
+    summary = rack_summary(long)
+    row = summary.iloc[0]
+    assert row["bins"] == 3
+    # Only the genuine 0 counts as out-of-rack; the NaN bin does not.
+    assert row["bins_out_of_rack"] == 1
+
+    non_finite = non_finite_rack(long)
+    assert len(non_finite) == 1
+    assert non_finite.iloc[0]["n_non_finite_bins"] == 1
+
+
+def test_non_finite_rack_bin_does_not_silently_vanish_from_qc_output(make_workbook):
+    """A non-finite in_rack bin must be visible in the QC tables that flow
+    into the CSV/report/panel, not merely dropped from analysis unremarked."""
+    def nan_in_rack(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return float('nan') if index == 0 else 1.0
+        return 5.0
+
+    path = make_workbook(tags=(1, 2), bins=3, values=nan_in_rack)
+    long = load_cage(path, 58616)
+
+    tables = qc_tables(long)
+    assert "rack_non_finite" in tables
+    non_finite = tables["rack_non_finite"]
+    # Both tags hit the non-finite bin at index 0 (values callback is not
+    # tag-specific here), so both must be named, not silently averaged away.
+    assert len(non_finite) == 2
+    assert set(non_finite["tag"]) == {1, 2}
+    assert (non_finite["n_non_finite_bins"] == 1).all()
+
+    # The bin is excluded from the masked frame entirely (not treated as
+    # "in rack"), i.e. only 2 of the 3 bins survive per tag.
+    masked = apply_rack_mask(long)
+    assert masked.loc[masked["tag"] == 1, "bin_start"].nunique() == 2
 
 
 def test_valid_bins_raises_when_in_rack_measure_missing(make_workbook):

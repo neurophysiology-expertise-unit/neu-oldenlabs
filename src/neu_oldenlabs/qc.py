@@ -2,7 +2,12 @@
 
 The one thing QC does change downstream is the rack mask: bins recorded while the
 cage was out of the rack are not observations of the animal's behaviour, so they
-are excluded from every metric rather than averaged into one.
+are excluded from every metric rather than averaged into one. A bin whose
+`in_rack` reading is non-finite (NaN, +-inf) is excluded the same way -- it is
+not evidence the cage was in the rack -- but is counted SEPARATELY from a
+genuine out-of-rack (0) reading (see `valid_bins`, `non_finite_rack`): folding
+it into the out-of-rack count would hide a different failure mode (a missing
+or corrupt reading) behind a normal one.
 """
 from __future__ import annotations
 
@@ -13,22 +18,31 @@ from .io import MEASURE_KIND, PERCENT_MEASURES
 
 
 def valid_bins(long: pd.DataFrame) -> pd.DataFrame:
+    """Build the rack-validity mask from the `in_rack` measure.
+
+    Three outcomes per bin, kept as separate signals:
+    - finite and > 0 -> valid: an observation of the animal's behaviour.
+    - finite and <= 0 (the real data only ever has 0) -> excluded, counted as
+      "out of rack" (see `rack_summary`).
+    - non-finite (NaN, +-inf) -> excluded, counted SEPARATELY as "non-finite"
+      (see `non_finite_rack`). This used to raise: a NaN rack status was
+      previously coerced to "out of rack" and silently dropped bins, so a
+      guard was added to stop that happening unnoticed. Controller ruling:
+      the guard's purpose was to stop such bins being silently excluded, not
+      to make them fatal -- on the real six-cage study this fires on exactly
+      one cell at the very first recorded bin of each of cages 58597, 58627
+      and 62923, which would otherwise block the entire analysis. So the bin
+      is excluded (never assumed valid, exactly as the guard intended) and
+      reported by name instead of raising.
+    """
     rack = long[long["measure"] == "in_rack"]
     if rack.empty:
         raise ValueError("no 'in_rack' measure in this export; cannot build the rack mask")
     mask = rack[["cage", "tag", "bin_start", "value"]].copy()
     values = mask.pop("value")
-    non_finite = ~np.isfinite(values)
-    if non_finite.any():
-        bad = mask[non_finite]
-        cage_count = bad["cage"].nunique()
-        tag_count = bad["tag"].nunique()
-        bin_count = len(bad)
-        raise ValueError(
-            f"non-finite in_rack values: {bin_count} bins across {tag_count} tag(s) "
-            f"in {cage_count} cage(s)"
-        )
-    mask["valid"] = values > 0
+    finite = np.isfinite(values)
+    mask["non_finite"] = ~finite
+    mask["valid"] = finite & (values > 0)
     return mask
 
 
@@ -38,15 +52,44 @@ def apply_rack_mask(long: pd.DataFrame) -> pd.DataFrame:
     if merged["valid"].isna().any():
         raise ValueError("bins with no rack status; the export is internally inconsistent")
     kept = merged[merged["valid"] & (merged["measure"] != "in_rack")]
-    return kept.drop(columns="valid").reset_index(drop=True)
+    return kept.drop(columns=["valid", "non_finite"]).reset_index(drop=True)
 
 
 def rack_summary(long: pd.DataFrame) -> pd.DataFrame:
+    """Per (cage, tag): total bins and how many were genuinely out of rack.
+
+    `bins_out_of_rack` counts only finite, non-positive `in_rack` readings --
+    it deliberately excludes non-finite readings (see `valid_bins`,
+    `non_finite_rack`), which are a different failure mode and are reported
+    in their own table so the two are never conflated.
+    """
     mask = valid_bins(long)
-    grouped = mask.groupby(["cage", "tag"], as_index=False).agg(
-        bins=("valid", "size"), bins_out_of_rack=("valid", lambda v: int((~v).sum())))
+    out_of_rack = (~mask["valid"]) & (~mask["non_finite"])
+    grouped = mask.assign(out_of_rack=out_of_rack).groupby(
+        ["cage", "tag"], as_index=False).agg(
+        bins=("valid", "size"), bins_out_of_rack=("out_of_rack", "sum"))
+    grouped["bins_out_of_rack"] = grouped["bins_out_of_rack"].astype(int)
     grouped["fraction_out"] = grouped["bins_out_of_rack"] / grouped["bins"]
     return grouped
+
+
+def non_finite_rack(long: pd.DataFrame) -> pd.DataFrame:
+    """Per (cage, tag): how many bins have a non-finite `in_rack` value.
+
+    These bins are excluded from analysis -- a non-finite reading is not
+    evidence the cage was in the rack -- but must never be folded into
+    `rack_summary`'s out-of-rack count (controller ruling, see `valid_bins`).
+    Only cage/tag pairs with at least one non-finite bin are listed, so an
+    empty result means every loaded `in_rack` reading was finite.
+    """
+    mask = valid_bins(long)
+    bad = mask[mask["non_finite"]]
+    columns = ["cage", "tag", "n_non_finite_bins"]
+    if bad.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (bad.groupby(["cage", "tag"], as_index=False).size()
+               .rename(columns={"size": "n_non_finite_bins"}))
+    return grouped[columns]
 
 
 def bin_regularity(long: pd.DataFrame) -> pd.DataFrame:
@@ -170,4 +213,5 @@ def qc_tables(long: pd.DataFrame) -> dict[str, pd.DataFrame]:
     masked = apply_rack_mask(long)
     return {"rack": rack_summary(long), "regularity": bin_regularity(long),
             "breaks": recording_breaks(long), "coverage": coverage(masked),
-            "ranges": range_violations(long), "missing": missing_values(long)}
+            "ranges": range_violations(long), "missing": missing_values(long),
+            "rack_non_finite": non_finite_rack(long)}
