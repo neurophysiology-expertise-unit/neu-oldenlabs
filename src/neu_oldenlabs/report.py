@@ -56,6 +56,62 @@ def _format_cell(value) -> str:
     return text.replace("|", "\\|")
 
 
+# p-value-shaped columns get their own compact formatter (3 significant
+# figures, switching to scientific notation for small magnitudes -- `g`
+# already does this) rather than `_format_cell`'s generic 4g: the owner's
+# complaint was specifically that a long decimal p-value overlaps its
+# neighbours in the rendered PDF. Both the raw and both pooled p columns are
+# listed here so the fix applies wherever any of them is displayed, not just
+# in the tables split out below.
+_P_VALUE_COLUMNS = {"p_value", "p_adjusted_bh", "pooled_p_value", "pooled_p_adjusted_bh"}
+
+
+def _format_p(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "n/a"
+    return f"{float(value):.3g}"
+
+
+def _p_stars(value) -> str:
+    """Significance stars for a p-value: `*` p < 0.05, `**` p < 0.005,
+    `***` p < 0.0005, blank otherwise (including NaN/None) -- for reading at a
+    glance; the numeric p-value is kept alongside (via `_format_p`) for quoting.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    value = float(value)
+    if value < 0.0005:
+        return "***"
+    if value < 0.005:
+        return "**"
+    if value < 0.05:
+        return "*"
+    return ""
+
+
+_STAR_LEGEND = ("*Significance stars, applied to both the raw and the FDR-adjusted "
+               "p-value: `*` p < 0.05, `**` p < 0.005, `***` p < 0.0005; blank = not "
+               "significant at any of these thresholds. The numeric p-value is kept "
+               "alongside (3 significant figures) for quoting.*")
+
+
+def _with_significance_stars(frame: pd.DataFrame, p_column: str, fdr_column: str,
+                             p_stars_column: str, fdr_stars_column: str) -> pd.DataFrame:
+    """Return a COPY of `frame` with two new star columns added.
+
+    Always copies rather than mutating in place: `frame` here is a live
+    result frame (e.g. `result["scan"]`) that other sections read from too,
+    and must not pick up display-only columns as a side effect of rendering
+    one table.
+    """
+    frame = frame.copy()
+    frame[p_stars_column] = (frame[p_column].map(_p_stars) if p_column in frame.columns
+                             else "")
+    frame[fdr_stars_column] = (frame[fdr_column].map(_p_stars) if fdr_column in frame.columns
+                               else "")
+    return frame
+
+
 def _markdown_table(frame: pd.DataFrame, columns: list[str] | None = None) -> str:
     """Render a DataFrame as a markdown table by hand (no `tabulate` dependency)."""
     if frame.empty:
@@ -63,7 +119,11 @@ def _markdown_table(frame: pd.DataFrame, columns: list[str] | None = None) -> st
     columns = columns or list(frame.columns)
     header = "| " + " | ".join(columns) + " |"
     sep = "| " + " | ".join("---" for _ in columns) + " |"
-    body = ["| " + " | ".join(_format_cell(row[c]) for c in columns) + " |"
+
+    def cell(row, column):
+        return _format_p(row[column]) if column in _P_VALUE_COLUMNS else _format_cell(row[column])
+
+    body = ["| " + " | ".join(cell(row, c) for c in columns) + " |"
             for _, row in frame.iterrows()]
     return "\n".join([header, sep, *body])
 
@@ -504,12 +564,17 @@ def _methods(study: StudyConfig, result: dict) -> str:
     return "\n".join(lines)
 
 
-_COMPARE_DISPLAY_COLUMNS = [
-    "measure", "n_mut", "n_wt", "n_mut_contributing", "n_wt_contributing",
-    "cages_contributing", "difference", "ci_low", "ci_high",
-    "hedges_g", "g_ci_low", "g_ci_high",
-    "p_value", "min_attainable_p", "assignments", "p_adjusted_bh",
-    "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
+# Split in two so neither block overflows the rendered PDF's page width (the
+# owner's report: "primary measures are very hard to read as a table the
+# numbers are overlapping to each other"). Both blocks repeat `measure` so
+# either reads on its own, including across a page break.
+_EFFECT_DISPLAY_COLUMNS = [
+    "measure", "n_mut", "n_wt", "cages_contributing",
+    "mean_mut", "mean_wt", "difference", "ci_low", "ci_high",
+]
+_INFERENCE_DISPLAY_COLUMNS = [
+    "measure", "hedges_g", "p_value", "p_stars", "p_adjusted_bh", "fdr_stars",
+    "lmm_p_value", "lmm_converged",
 ]
 
 
@@ -548,20 +613,49 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
             "",
         ]
     else:
-        primary = scan[scan["measure"].isin(study.primary_measures)]
+        scan_display = _with_significance_stars(scan, "p_value", "p_adjusted_bh",
+                                                 "p_stars", "fdr_stars")
+        primary = scan_display[scan_display["measure"].isin(study.primary_measures)]
         primary = primary.set_index("measure").reindex(study.primary_measures).reset_index()
         primary = primary.dropna(subset=["p_value"])
         lines += [
             "### Primary measures (pre-specified)",
             "",
-            _markdown_table(primary, _COMPARE_DISPLAY_COLUMNS)
-            if not primary.empty else
-            "*(none of the pre-specified primary measures produced a row -- see the "
-            "scan below and its skipped-measure notes.)*",
+            "Each table is split into two blocks, both keyed on `measure`, so "
+            "neither overflows the page: effect sizes first, then inference.",
             "",
+        ]
+        if primary.empty:
+            lines += [
+                "*(none of the pre-specified primary measures produced a row -- see "
+                "the scan below and its skipped-measure notes.)*",
+                "",
+            ]
+        else:
+            lines += [
+                "**Effect sizes:**",
+                "",
+                _markdown_table(primary, _EFFECT_DISPLAY_COLUMNS),
+                "",
+                "**Inference:**",
+                "",
+                _markdown_table(primary, _INFERENCE_DISPLAY_COLUMNS),
+                "",
+                _STAR_LEGEND,
+                "",
+            ]
+        lines += [
             "### Full scan (hypothesis-generating, FDR-corrected)",
             "",
-            _markdown_table(scan, _COMPARE_DISPLAY_COLUMNS),
+            "**Effect sizes:**",
+            "",
+            _markdown_table(scan_display, _EFFECT_DISPLAY_COLUMNS),
+            "",
+            "**Inference:**",
+            "",
+            _markdown_table(scan_display, _INFERENCE_DISPLAY_COLUMNS),
+            "",
+            _STAR_LEGEND,
             "",
         ]
         skipped = scan["skipped_measures"].iloc[0] if "skipped_measures" in scan.columns else ""
@@ -576,17 +670,25 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
     return "\n".join(lines)
 
 
-_POOLED_COMPARISON_COLUMNS = [
-    "measure",
-    "difference", "ci_low", "ci_high", "hedges_g", "p_value", "p_adjusted_bh",
-    "pooled_difference", "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
-    "pooled_p_value", "pooled_p_adjusted_bh",
+# Split, like the primary-measures and full-scan tables in `_results`, so
+# neither block overflows the page; both repeat `measure`.
+_POOLED_COMPARISON_EFFECT_COLUMNS = [
+    "measure", "difference", "ci_low", "ci_high",
+    "pooled_difference", "pooled_ci_low", "pooled_ci_high",
+]
+_POOLED_COMPARISON_INFERENCE_COLUMNS = [
+    "measure", "hedges_g", "p_value", "p_stars", "p_adjusted_bh", "fdr_stars",
+    "pooled_hedges_g", "pooled_p_value", "pooled_p_stars", "pooled_p_adjusted_bh",
+    "pooled_fdr_stars",
 ]
 
-_POOLED_SCAN_DISPLAY_COLUMNS = [
+_POOLED_SCAN_EFFECT_COLUMNS = [
     "measure", "n_mut", "n_wt", "pooled_mean_mut", "pooled_mean_wt",
-    "pooled_difference", "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
-    "pooled_p_value", "pooled_min_attainable_p", "pooled_draws", "pooled_p_adjusted_bh",
+    "pooled_difference", "pooled_ci_low", "pooled_ci_high",
+]
+_POOLED_SCAN_INFERENCE_COLUMNS = [
+    "measure", "pooled_hedges_g", "pooled_p_value", "pooled_p_stars",
+    "pooled_p_adjusted_bh", "pooled_fdr_stars", "pooled_draws", "pooled_min_attainable_p",
 ]
 
 
@@ -692,13 +794,26 @@ def _secondary_pooled_analysis(study: StudyConfig, result: dict) -> str:
         return "\n".join(lines)
 
     if has_stratified:
-        merged = scan.merge(pooled, on="measure", how="outer")
+        scan_display = _with_significance_stars(scan, "p_value", "p_adjusted_bh",
+                                                 "p_stars", "fdr_stars")
+        pooled_display_for_merge = _with_significance_stars(
+            pooled, "pooled_p_value", "pooled_p_adjusted_bh",
+            "pooled_p_stars", "pooled_fdr_stars")
+        merged = scan_display.merge(pooled_display_for_merge, on="measure", how="outer")
         primary = merged[merged["measure"].isin(study.primary_measures)]
         primary = primary.set_index("measure").reindex(study.primary_measures).reset_index()
         lines += [
             "### Primary measures: stratified vs. pooled, side by side",
             "",
-            _markdown_table(primary, _POOLED_COMPARISON_COLUMNS),
+            "**Effect sizes:**",
+            "",
+            _markdown_table(primary, _POOLED_COMPARISON_EFFECT_COLUMNS),
+            "",
+            "**Inference:**",
+            "",
+            _markdown_table(primary, _POOLED_COMPARISON_INFERENCE_COLUMNS),
+            "",
+            _STAR_LEGEND,
             "",
         ]
 
@@ -727,13 +842,23 @@ def _secondary_pooled_analysis(study: StudyConfig, result: dict) -> str:
     n_pooled_flagged = int((pooled["pooled_p_adjusted_bh"] < 0.05).sum())
     flagged_measures = pooled.loc[pooled["pooled_p_adjusted_bh"] < 0.05, "measure"].tolist()
     flagged_line = (", ".join(flagged_measures) if flagged_measures else "none")
+    pooled_display = _with_significance_stars(pooled, "pooled_p_value", "pooled_p_adjusted_bh",
+                                              "pooled_p_stars", "pooled_fdr_stars")
     lines += [
         f"**Pooled scan, FDR-significant (q < 0.05):** {n_pooled_flagged} of "
         f"{len(pooled)} scanned measure(s): {flagged_line}.",
         "",
         "### Full pooled scan (hypothesis-generating, FDR-corrected)",
         "",
-        _markdown_table(pooled, _POOLED_SCAN_DISPLAY_COLUMNS),
+        "**Effect sizes:**",
+        "",
+        _markdown_table(pooled_display, _POOLED_SCAN_EFFECT_COLUMNS),
+        "",
+        "**Inference:**",
+        "",
+        _markdown_table(pooled_display, _POOLED_SCAN_INFERENCE_COLUMNS),
+        "",
+        _STAR_LEGEND,
         "",
     ]
     skipped = pooled["skipped_measures"].iloc[0] if "skipped_measures" in pooled.columns else ""

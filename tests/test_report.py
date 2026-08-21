@@ -4,7 +4,12 @@ import dataclasses
 
 from neu_oldenlabs import groups
 from neu_oldenlabs.pipeline import run_study
-from neu_oldenlabs.report import build_study_report
+from neu_oldenlabs.report import (_EFFECT_DISPLAY_COLUMNS, _INFERENCE_DISPLAY_COLUMNS,
+                                  _POOLED_COMPARISON_EFFECT_COLUMNS,
+                                  _POOLED_COMPARISON_INFERENCE_COLUMNS,
+                                  _POOLED_SCAN_EFFECT_COLUMNS,
+                                  _POOLED_SCAN_INFERENCE_COLUMNS, _format_p, _p_stars,
+                                  build_study_report)
 
 
 def test_report_names_missing_cages_and_the_permutation_count(synthetic_study, tmp_path):
@@ -188,3 +193,63 @@ def test_methods_bin_timing_judges_each_cages_cadence_against_its_own_bin_width(
     assert "cage 1002: uniform at 60 minutes" in text
     assert "50-min coverage hole" not in text
     assert "cage 58616: uniform at 10 minutes" in text
+
+
+# ============================================================================
+# Table readability: split effect/inference blocks and significance stars
+# (owner request: wide tables overlap in the rendered PDF; use stars instead
+# of long decimals for p-values, and split each wide table so it fits).
+# ============================================================================
+
+
+def test_p_stars_thresholds_are_pinned_exactly():
+    # p == 0.05 gets NO star (the threshold is strict "<", not "<="); 0.049
+    # gets one; 0.004 gets two; 0.0004 gets three. These four values pin the
+    # exact boundaries the owner asked for ("0<0.05 one star 0<0.005 2
+    # start[sic] etc").
+    assert _p_stars(0.05) == ""
+    assert _p_stars(0.049) == "*"
+    assert _p_stars(0.004) == "**"
+    assert _p_stars(0.0004) == "***"
+
+
+def test_p_stars_handles_missing_values():
+    assert _p_stars(None) == ""
+    assert _p_stars(float("nan")) == ""
+
+
+def test_format_p_is_compact_and_uses_scientific_notation_for_small_values():
+    assert _format_p(0.049) == "0.049"
+    assert _format_p(0.0000123) == "1.23e-05"
+    assert _format_p(float("nan")) == "n/a"
+
+
+def test_effect_and_inference_display_columns_both_carry_the_measure_column():
+    # Every split block must repeat `measure` so either half reads on its
+    # own, including across a page break -- per the owner's suggestion
+    # ("repeat the first column and continue tables in the following page").
+    for columns in (_EFFECT_DISPLAY_COLUMNS, _INFERENCE_DISPLAY_COLUMNS,
+                    _POOLED_COMPARISON_EFFECT_COLUMNS, _POOLED_COMPARISON_INFERENCE_COLUMNS,
+                    _POOLED_SCAN_EFFECT_COLUMNS, _POOLED_SCAN_INFERENCE_COLUMNS):
+        assert columns[0] == "measure"
+
+
+def test_inference_blocks_carry_star_columns_next_to_their_p_values():
+    assert "p_stars" in _INFERENCE_DISPLAY_COLUMNS
+    assert "fdr_stars" in _INFERENCE_DISPLAY_COLUMNS
+    assert "pooled_p_stars" in _POOLED_SCAN_INFERENCE_COLUMNS
+    assert "pooled_fdr_stars" in _POOLED_SCAN_INFERENCE_COLUMNS
+    assert "pooled_p_stars" in _POOLED_COMPARISON_INFERENCE_COLUMNS
+    assert "pooled_fdr_stars" in _POOLED_COMPARISON_INFERENCE_COLUMNS
+
+
+def test_report_prints_significance_stars_and_the_legend(synthetic_study, tmp_path):
+    text = build_study_report(synthetic_study, tmp_path / "out").read_text()
+    assert "Significance stars" in text
+    assert "p < 0.05" in text and "p < 0.005" in text and "p < 0.0005" in text
+
+
+def test_report_tables_split_into_effect_and_inference_blocks(synthetic_study, tmp_path):
+    text = build_study_report(synthetic_study, tmp_path / "out").read_text()
+    assert "**Effect sizes:**" in text
+    assert "**Inference:**" in text
