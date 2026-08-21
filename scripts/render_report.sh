@@ -21,7 +21,17 @@ if [ -z "$header" ] && [ -f "$experiment/../pdf-header.tex" ]; then
 fi
 
 # --resource-path lets pandoc resolve the relative figure paths in report.md.
-common=(--standalone --toc --resource-path="$experiment" --metadata title="Oldenlabs home-cage report")
+# --lua-filter forces every table to explicit, content-proportional column
+# widths: a plain markdown pipe table parses with width 0 ("auto") per
+# column, which pandoc's LaTeX writer renders as an unwrapped `l` column --
+# fine for a narrow table, but the wide results tables here (measure names
+# up to 31 characters, headers like `cages_contributing`) then run straight
+# off the page margin instead of wrapping. See table-widths.lua for why
+# pandoc's own width heuristic isn't a substitute for this.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+common=(--standalone --toc --resource-path="$experiment"
+        --lua-filter="$script_dir/table-widths.lua"
+        --metadata title="Oldenlabs home-cage report")
 
 pandoc "$report" "${common[@]}" --self-contained -o "$experiment/report.html"
 echo "wrote $experiment/report.html"
