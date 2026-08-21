@@ -17,6 +17,7 @@ from itertools import combinations, product
 
 import numpy as np
 import pandas as pd
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from . import RNG_SEED
 
@@ -207,11 +208,18 @@ def mixed_model(values: pd.DataFrame) -> dict:
     raising -- a bare try/except therefore misses it and reports
     `converged: True` with an se and p-value drawn from a singular Hessian.
     Every warning raised during the fit call is caught instead of left to
-    print to stderr (which would spray across a thirty-measure scan) and is
-    treated as a convergence failure: `converged` is forced to False and the
-    warning text is kept in `note`, alongside the coefficient/se/p-value
-    statsmodels still reports, so a caller can see both the number and the
-    reason not to trust it.
+    print to stderr (which would spray across a thirty-measure scan), but
+    only a `ConvergenceWarning` is treated as a convergence failure. Catching
+    ANY warning category (the previous behaviour used
+    `warnings.simplefilter("always")` and then checked whether the caught
+    list was non-empty at all) means an unrelated warning -- a `FutureWarning`
+    from a library upgrade, for instance -- would mark every row of a scan as
+    non-converged and void the sensitivity analysis for reasons that have
+    nothing to do with the fit. `converged` is forced to False, and the
+    convergence warning text is kept in `note`, only when a real
+    ConvergenceWarning was raised; other warnings are still swallowed (so
+    they do not spray to stderr across a scan) but leave `converged`
+    unaffected.
     """
     import statsmodels.formula.api as smf
 
@@ -224,8 +232,9 @@ def mixed_model(values: pd.DataFrame) -> dict:
     except Exception as error:  # noqa: BLE001 - convergence failure is a result, not a crash
         return {"coefficient": float("nan"), "se": float("nan"),
                 "p_value": float("nan"), "converged": False, "note": str(error)}
-    converged = bool(fit.converged) and not caught
-    note = "; ".join(str(warning.message) for warning in caught)
+    convergence_warnings = [w for w in caught if issubclass(w.category, ConvergenceWarning)]
+    converged = bool(fit.converged) and not convergence_warnings
+    note = "; ".join(str(warning.message) for warning in convergence_warnings)
     return {"coefficient": float(fit.params["is_mut"]), "se": float(fit.bse["is_mut"]),
             "p_value": float(fit.pvalues["is_mut"]), "converged": converged, "note": note}
 
@@ -250,10 +259,24 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
     p, assignments, floor = exact_stratified_permutation(values)
     low, high = cluster_bootstrap_ci(values)
     model = mixed_model(values)
-    return {
+
+    # `n_mut`/`n_wt` count every animal with a non-NaN value, INCLUDING
+    # animals in a zero-weight (single-genotype) cage that contributes no
+    # within-cage contrast to the test at all -- so with the real study's
+    # composition, `n_mut`/`n_wt` can read 10/15 for a comparison that
+    # actually only used 10 mut and 10 wt animals (the 5 extra wt are cage
+    # 58616, all-wildtype, weight 0). `n_mut_contributing`/`n_wt_contributing`
+    # restrict to animals in cages with weight > 0, i.e. the counts the test
+    # actually used; the totals are kept alongside, distinctly labelled.
+    contributing_cages = set(weights.loc[weights["weight"] > 0, "cage"])
+    contributing_values = values[values["cage"].isin(contributing_cages)]
+
+    row = {
         "measure": measure,
         "n_mut": int((values["genotype"] == "mut").sum()),
         "n_wt": int((values["genotype"] == "wt").sum()),
+        "n_mut_contributing": int((contributing_values["genotype"] == "mut").sum()),
+        "n_wt_contributing": int((contributing_values["genotype"] == "wt").sum()),
         "cages_contributing": contributing,
         "mean_mut": float(values.loc[values["genotype"] == "mut", "value"].mean()),
         "mean_wt": float(values.loc[values["genotype"] == "wt", "value"].mean()),
@@ -265,13 +288,21 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
         "lmm_p_value": model["p_value"], "lmm_converged": model["converged"],
         "lmm_note": model["note"],
     }
+    assert list(row.keys()) == _COMPARE_COLUMNS, (
+        "_COMPARE_COLUMNS (the hand-maintained duplicate used to give an "
+        "all-skipped scan the right shape) has drifted out of sync with the "
+        f"keys compare() actually returns: {list(row.keys())} != {_COMPARE_COLUMNS}")
+    return row
 
 
 # The columns `compare` produces, in order -- kept alongside `scan` so an
 # all-skipped scan can still return a frame with the right shape instead of
 # one with no columns at all (which would KeyError on `p_adjusted_bh`).
+# `compare` asserts its own return keys match this list on every call, so the
+# two cannot silently drift apart.
 _COMPARE_COLUMNS = [
-    "measure", "n_mut", "n_wt", "cages_contributing", "mean_mut", "mean_wt", "difference",
+    "measure", "n_mut", "n_wt", "n_mut_contributing", "n_wt_contributing",
+    "cages_contributing", "mean_mut", "mean_wt", "difference",
     "ci_low", "ci_high", "hedges_g", "p_value", "assignments", "min_attainable_p",
     "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
 ]

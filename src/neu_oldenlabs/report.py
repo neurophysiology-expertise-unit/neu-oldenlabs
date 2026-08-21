@@ -20,6 +20,7 @@ from . import groups, qc
 from .config import StudyConfig
 from .io import MEASURE_KIND
 from .pipeline import _base_measure, run_study
+from .profile import IDENTITY
 
 # Figure filenames, in the order `pipeline.run_study` writes them, with the
 # caption each earns per the design spec's figure list (section 8).
@@ -36,7 +37,9 @@ _FIGURES = [
     ("daily_trajectories", "Daily trajectories: one line per animal across the "
                            "recording window, coloured by genotype."),
     ("qc_panel", "QC panel: rack-mask fraction, recording breaks, out-of-range "
-                "values, and mean valid hours per day, one bar per cage."),
+                "values, mean valid hours per day, and fraction of values "
+                "missing (NaN), one bar per cage; the title flags when bin "
+                "width varies across cages."),
 ]
 
 
@@ -108,6 +111,71 @@ def _data_and_coverage(study: StudyConfig, result: dict) -> str:
     return "\n".join(lines)
 
 
+def _quality_control(result: dict) -> str:
+    """Bin width per cage and the missing-value audit, stated explicitly.
+
+    Both come straight from `qc.qc_tables` (via `result["qc"]`): bin width
+    from `qc.bin_regularity` (already computed, previously not surfaced
+    anywhere a reader would see it), and the missing-value fraction from the
+    new `qc.missing_values` audit. A mixed-resolution study (this study's real
+    exports: cage 58616 uses 600 s bins, the other five use 3600 s) or a
+    silently-coerced non-numeric cell (a literal `'NaN'` string, for example)
+    must be STATED here, not left for a reader to discover by noticing a
+    figure looks wrong.
+    """
+    regularity = result["qc"]["regularity"]
+    missing = result["qc"]["missing"]
+
+    lines = ["## Quality control", ""]
+
+    if regularity.empty:
+        lines += ["No bins were loaded, so bin width cannot be described.", ""]
+    else:
+        widths_by_cage = {cage: sorted(set(block["duration_s"]))
+                          for cage, block in regularity.groupby("cage")}
+        distinct = sorted({w for widths in widths_by_cage.values() for w in widths})
+        if len(distinct) > 1:
+            per_cage = "; ".join(
+                f"cage {cage}: {'/'.join(f'{w:.0f}' for w in widths)} s"
+                for cage, widths in sorted(widths_by_cage.items()))
+            lines += [
+                f"**Bin width varies across cages in this run:** {per_cage}. Every "
+                "figure and metric in this report normalises to a duration-weighted, "
+                "per-valid-hour basis before comparing cages -- a raw per-bin value "
+                "is NOT comparable across different bin widths (pooling a 600 s-bin "
+                "cage with a 3600 s-bin cage in raw per-bin units would manufacture a "
+                "difference that is pure bin-width artefact).",
+                "",
+            ]
+        else:
+            lines += [f"Every cage in this run shares one bin width: "
+                     f"{distinct[0]:.0f} s.", ""]
+
+    total_bins = int(missing["bins"].sum()) if not missing.empty else 0
+    total_missing = int(missing["missing"].sum()) if not missing.empty else 0
+    if total_missing > 0:
+        worst = (missing[missing["missing"] > 0]
+                .sort_values("fraction_missing", ascending=False).head(10))
+        lines += [
+            f"**Missing values.** {total_missing} of {total_bins} loaded bins "
+            f"({total_missing / total_bins:.2%}) carry a non-numeric value (e.g. a "
+            "literal `'NaN'` string), coerced to NaN at parse time (`io.load_cage`). "
+            "These bins are excluded from the duration weight in every downstream "
+            "aggregate, not counted as zero; a cage/tag/measure with no non-missing "
+            "bin at all yields NaN, never 0.0. Worst-affected cage/tag/measure "
+            "combinations:",
+            "",
+            _markdown_table(worst, ["cage", "tag", "measure", "bins", "missing",
+                                    "fraction_missing"]),
+            "",
+        ]
+    else:
+        lines += ["**Missing values.** No non-numeric values were found in any "
+                 "loaded export.", ""]
+
+    return "\n".join(lines)
+
+
 def _count_kind_measures(measures: list[str]) -> list[str]:
     """Base measure names among `measures` whose daily rule is per-valid-hour.
 
@@ -115,6 +183,16 @@ def _count_kind_measures(measures: list[str]) -> list[str]:
     valid hour (see `MEASURE_KIND` in `io.py`), not a per-day total. This reads
     that mapping directly rather than hardcoding which measures it applies to,
     so the sentence below cannot drift if a measure's kind ever changes.
+
+    `measures` should be every measure ACTUALLY REPORTED (the profile table's
+    own columns), not just `study.primary_measures + study.scan_measures`:
+    with an empty `scan_measures` (the common case -- see
+    `pipeline._default_scan_measures`), that config-only list omits
+    `climbing_events_*`, `rearing_events_*`, and `sleep_bouts_*` whenever none
+    of them happens to be a primary measure, even though they are still
+    per-valid-hour columns sitting right there in the profile table and the
+    full scan. A reader would then read e.g. `rearing_events_dark` as a
+    nightly count with nothing in the Methods section to correct them.
     """
     bases = sorted({_base_measure(m) for m in measures})
     return [b for b in bases if MEASURE_KIND.get(b) == "count"]
@@ -203,8 +281,13 @@ def _bin_timing_sentence(result: dict) -> str:
 
 def _methods(study: StudyConfig, result: dict) -> str:
     scan = result["scan"]
-    all_measures = list(dict.fromkeys(list(study.primary_measures) + list(study.scan_measures)))
-    per_hour = _count_kind_measures(all_measures)
+    # Every measure column ACTUALLY REPORTED in the profile table -- not just
+    # `study.primary_measures + study.scan_measures` -- so the disclosure
+    # below covers climbing_events/rearing_events/sleep_bouts even when
+    # scan_measures is empty and none of them happens to be a primary
+    # measure. See _count_kind_measures.
+    reported_measures = [c for c in result["profile"].columns if c not in IDENTITY]
+    per_hour = _count_kind_measures(reported_measures)
     per_hour_line = _count_kind_sentence(per_hour)
 
     if "measure" in scan.columns and not scan.empty:
@@ -242,7 +325,12 @@ def _methods(study: StudyConfig, result: dict) -> str:
         "within-cage (mut - wt) differences, weighted by "
         "`n_mut * n_wt / (n_mut + n_wt)` per cage. A cage housing a single genotype "
         "has weight zero and drops out of the test by construction -- see "
-        "Interpretation safeguards for which cage(s) that is in this run. Genotype "
+        "Interpretation safeguards for which cage(s) that is in this run. Every "
+        "per-measure row below reports both `n_mut`/`n_wt` (every animal with a "
+        "non-NaN value, including any zero-weight cage) and "
+        "`n_mut_contributing`/`n_wt_contributing` (animals in cages that actually "
+        "carry weight in the test); read the CONTRIBUTING counts as the sample "
+        "size the comparison actually used. Genotype "
         "labels are permuted only WITHIN a cage, so cage-level differences (housing, "
         "cohort, cage-mate composition) cannot masquerade as a genotype effect. The "
         "design enumerates `prod(C(n_cage, k_cage))` over contributing cages -- small "
@@ -293,7 +381,8 @@ def _methods(study: StudyConfig, result: dict) -> str:
 
 
 _COMPARE_DISPLAY_COLUMNS = [
-    "measure", "n_mut", "n_wt", "cages_contributing", "difference", "ci_low", "ci_high",
+    "measure", "n_mut", "n_wt", "n_mut_contributing", "n_wt_contributing",
+    "cages_contributing", "difference", "ci_low", "ci_high",
     "hedges_g", "p_value", "min_attainable_p", "assignments", "p_adjusted_bh",
     "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
 ]
@@ -481,6 +570,7 @@ def build_study_report(study: StudyConfig, output: Path, cache_dir: Path | None 
         f"Generated {date} (UTC).",
         "",
         _data_and_coverage(study, result),
+        _quality_control(result),
         _methods(study, result),
         _results(study, result, output),
         _safeguards(study, result),

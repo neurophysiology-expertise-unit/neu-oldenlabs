@@ -9,9 +9,10 @@ import pytest
 from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
-from neu_oldenlabs.groups import (benjamini_hochberg, cage_weights, cluster_bootstrap_ci,
-                                  compare, count_assignments, exact_stratified_permutation,
-                                  hedges_g, mixed_model, scan, stratified_difference)
+from neu_oldenlabs.groups import (_COMPARE_COLUMNS, benjamini_hochberg, cage_weights,
+                                  cluster_bootstrap_ci, compare, count_assignments,
+                                  exact_stratified_permutation, hedges_g, mixed_model, scan,
+                                  stratified_difference)
 
 # The real study composition: 58616 is 5 wt / 0 mut, 58623 and 66336 are 2 wt / 3 mut,
 # 58627 is 3 wt / 1 mut, 62923 is 1 wt / 1 mut, 58597 is 2 wt / 2 mut.
@@ -148,9 +149,17 @@ def test_bootstrap_interval_is_reproducible_and_brackets_the_observed_statistic(
 
 
 def test_benjamini_hochberg_matches_a_hand_computed_example():
-    raw = np.array([0.01, 0.02, 0.03, 0.04])
+    # [0.01, 0.02, 0.03, 0.04] is a degenerate example: every step-up value
+    # p_i * n / i comes out to exactly 0.04 for every i, so the cumulative-
+    # minimum step -- the only non-trivial line in `benjamini_hochberg` -- is
+    # never exercised; the test would pass identically with that line deleted.
+    # Here the step-up values before the cumulative min are
+    # [0.04, 0.04, 0.12, 0.10]: rank 3's 0.12 must be pulled down to rank 4's
+    # smaller 0.10 by the cumulative-min-from-the-largest-p-value step, which
+    # is the only place that step does anything.
+    raw = np.array([0.01, 0.02, 0.09, 0.10])
     adjusted = benjamini_hochberg(raw)
-    assert np.allclose(adjusted, [0.04, 0.04, 0.04, 0.04])
+    assert np.allclose(adjusted, [0.04, 0.04, 0.10, 0.10])
 
 
 def test_compare_returns_a_row_with_counts_effect_and_interval():
@@ -159,6 +168,10 @@ def test_compare_returns_a_row_with_counts_effect_and_interval():
     row = compare(profile, "distance_cm_all")
     assert row["measure"] == "distance_cm_all"
     assert row["n_mut"] == 10 and row["n_wt"] == 15
+    # cage 58616 (5 wt, 0 mut) has weight 0 and contributes no within-cage
+    # contrast; the *_contributing counts must reflect only the animals the
+    # test actually used, not the totals across every loaded cage.
+    assert row["n_mut_contributing"] == 10 and row["n_wt_contributing"] == 10
     assert row["cages_contributing"] == 5
     assert row["ci_low"] < row["difference"] < row["ci_high"]
     # 1/4800, not 2/4800 -- the real composition has unbalanced contributing
@@ -256,6 +269,42 @@ def test_mixed_model_note_is_empty_on_an_ordinary_converged_fit():
     result = mixed_model(values)
     assert result["converged"] is True
     assert result["note"] == ""
+
+
+def test_mixed_model_is_not_marked_non_converged_by_an_unrelated_warning():
+    # `warnings.simplefilter("always")` catches EVERY warning category during
+    # the fit call, not just convergence ones. The old code treated the mere
+    # presence of any caught warning as a convergence failure, so a single
+    # FutureWarning from a library upgrade would mark every row of a scan as
+    # non-converged and void the sensitivity analysis for reasons that have
+    # nothing to do with whether the fit actually converged.
+    values = study_values(effect=3.0, seed=5)
+    original_fit = MixedLM.fit
+
+    def fit_and_warn(self, *args, **kwargs):
+        warnings.warn("some unrelated deprecation notice", FutureWarning)
+        return original_fit(self, *args, **kwargs)
+
+    with patch.object(MixedLM, "fit", fit_and_warn):
+        with warnings.catch_warnings(record=True) as leaked:
+            warnings.simplefilter("always")
+            result = mixed_model(values)
+
+    assert result["converged"] is True
+    assert result["note"] == ""
+    assert leaked == []  # still swallowed, so it doesn't spray across a scan
+
+
+def test_compare_columns_constant_matches_compares_actual_return_keys():
+    # `_COMPARE_COLUMNS` is a hand-maintained duplicate of compare()'s return
+    # keys, kept so an all-skipped scan can still return a frame with the
+    # right shape. `compare` asserts this on every call; this test pins it
+    # down directly so a future edit that adds/renames/reorders a field in
+    # one place without the other fails immediately and obviously.
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    row = compare(profile, "distance_cm_all")
+    assert list(row.keys()) == _COMPARE_COLUMNS
 
 
 def test_scan_returns_expected_columns_when_every_measure_is_skipped():
