@@ -576,6 +576,173 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
     return "\n".join(lines)
 
 
+_POOLED_COMPARISON_COLUMNS = [
+    "measure",
+    "difference", "ci_low", "ci_high", "hedges_g", "p_value", "p_adjusted_bh",
+    "pooled_difference", "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
+    "pooled_p_value", "pooled_p_adjusted_bh",
+]
+
+_POOLED_SCAN_DISPLAY_COLUMNS = [
+    "measure", "n_mut", "n_wt", "pooled_mean_mut", "pooled_mean_wt",
+    "pooled_difference", "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
+    "pooled_p_value", "pooled_min_attainable_p", "pooled_draws", "pooled_p_adjusted_bh",
+]
+
+
+def _secondary_pooled_analysis(study: StudyConfig, result: dict) -> str:
+    """SECONDARY section: the cage-ignoring pooled comparison.
+
+    Run at the study owner's explicit request ("run analysis not within but
+    all wildtypes and all mutants irrespectful of where they are coming
+    from"), never as a replacement for the primary cage-stratified result
+    above. Every number is read off `result["scan"]` / `result["scan_pooled"]`
+    -- the frames `pipeline.run_study` actually computed -- never typed by
+    hand, so this section cannot drift from the analysis it describes.
+    """
+    scan = result["scan"]
+    pooled = result["scan_pooled"]
+    weights = _cage_weights(result["profile"])
+
+    lines = [
+        "## Secondary analysis: pooled comparison ignoring cage (owner-requested)",
+        "",
+        "**This section was run at the study owner's explicit request** -- "
+        "\"run analysis not within but all wildtypes and all mutants irrespectful "
+        "of where they are coming from\" -- and is a SECONDARY, WEAKER analysis. "
+        "It is never a replacement for the primary cage-stratified comparison "
+        "above: it pools every wildtype animal against every mutant animal with "
+        "cage identity IGNORED ENTIRELY, discarding the cage-stratification the "
+        "primary analysis uses precisely because cages differ for reasons that "
+        "have nothing to do with genotype. As a result, this analysis CANNOT "
+        "separate a genotype effect from a cage effect confounded with genotype.",
+        "",
+    ]
+
+    if weights is not None:
+        single_genotype = weights[(weights["n_mut"] == 0) | (weights["n_wt"] == 0)]
+        if not single_genotype.empty:
+            parts = [
+                f"cage {int(row.cage)} contributes {int(row.n_wt)} wildtype and "
+                f"{int(row.n_mut)} mutant animal(s)"
+                for row in single_genotype.itertuples()
+            ]
+            lines += [
+                "**Cage-effect confound in this run.** " + "; ".join(parts) + ". "
+                "Any cage-specific effect (housing, cohort, whatever) in a "
+                "single-genotype cage loads entirely onto that genotype's pooled "
+                "mean below, with no within-cage contrast to net it against. The "
+                "stratified analysis above assigns that cage weight zero for "
+                "exactly this reason; the pooled analysis below cannot, by "
+                "construction.",
+                "",
+            ]
+        else:
+            lines += [
+                "**Cage-effect confound in this run.** Every loaded cage in this "
+                "run houses both genotypes, so no single cage's idiosyncrasies "
+                "load entirely onto one genotype's pooled mean below -- but the "
+                "pooled test still cannot distinguish a genotype effect from a "
+                "cage effect that varies smoothly across cages, only the "
+                "extreme single-genotype-cage case.",
+                "",
+            ]
+
+    draws = None
+    if "pooled_draws" in pooled.columns and not pooled.empty:
+        draws = int(pooled["pooled_draws"].iloc[0])
+    if draws is not None:
+        lines += [
+            f"**Monte Carlo, not exact.** The pooled p-value below is estimated "
+            f"from {draws:,} label-shuffles across ALL animals (cage ignored), "
+            f"seeded from `neu_oldenlabs.RNG_SEED` for reproducibility -- NOT an "
+            f"exact enumeration like the stratified test's p-value above. It can "
+            f"never read exactly 0 (`pooled_min_attainable_p` = "
+            f"1/{draws + 1:,} = {1 / (draws + 1):.6g}).",
+            "",
+        ]
+    else:
+        lines += [
+            "**Monte Carlo, not exact.** The pooled comparison, when computed, "
+            "estimates its p-value from a seeded label-shuffle across all "
+            "animals rather than an exact enumeration -- see below for whether "
+            "any measure in this run produced one.",
+            "",
+        ]
+
+    lines += [
+        "**Where the two analyses disagree, trust the stratified one.** The "
+        "stratified (cage-controlled) result above is the one that removes "
+        "cage as a confound; the pooled result below does not. Read a "
+        "pooled-only finding as a candidate cage effect wearing a genotype "
+        "label, not as independent confirmation.",
+        "",
+    ]
+
+    has_stratified = "measure" in scan.columns and not scan.empty
+    has_pooled = "measure" in pooled.columns and not pooled.empty
+
+    if not has_pooled:
+        reason = "; ".join(pooled.attrs.get("skipped_measures", []) or
+                           ["no measure produced a pooled comparison"])
+        lines += [
+            f"No pooled comparison was computed for any measure: {reason}.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    if has_stratified:
+        merged = scan.merge(pooled, on="measure", how="outer")
+        primary = merged[merged["measure"].isin(study.primary_measures)]
+        primary = primary.set_index("measure").reindex(study.primary_measures).reset_index()
+        lines += [
+            "### Primary measures: stratified vs. pooled, side by side",
+            "",
+            _markdown_table(primary, _POOLED_COMPARISON_COLUMNS),
+            "",
+        ]
+
+        strat_sig = set(scan.loc[scan["p_adjusted_bh"] < 0.05, "measure"])
+        pooled_sig = set(pooled.loc[pooled["pooled_p_adjusted_bh"] < 0.05, "measure"])
+        only_stratified = sorted(strat_sig - pooled_sig)
+        only_pooled = sorted(pooled_sig - strat_sig)
+        lines += [
+            "**Where the two disagree (FDR q < 0.05 in one but not the other).**",
+            "",
+            f"- Significant only in the stratified (cage-controlled) scan: "
+            f"{', '.join(only_stratified) if only_stratified else 'none'}.",
+            f"- Significant only in the pooled (cage-ignoring) scan: "
+            f"{', '.join(only_pooled) if only_pooled else 'none'}"
+            + (" -- per the caveat above, read this as a candidate cage confound, "
+               "not independent confirmation." if only_pooled else "."),
+            "",
+        ]
+    else:
+        lines += [
+            "*(No stratified scan was available to compare against -- see Results "
+            "above for why.)*",
+            "",
+        ]
+
+    n_pooled_flagged = int((pooled["pooled_p_adjusted_bh"] < 0.05).sum())
+    flagged_measures = pooled.loc[pooled["pooled_p_adjusted_bh"] < 0.05, "measure"].tolist()
+    flagged_line = (", ".join(flagged_measures) if flagged_measures else "none")
+    lines += [
+        f"**Pooled scan, FDR-significant (q < 0.05):** {n_pooled_flagged} of "
+        f"{len(pooled)} scanned measure(s): {flagged_line}.",
+        "",
+        "### Full pooled scan (hypothesis-generating, FDR-corrected)",
+        "",
+        _markdown_table(pooled, _POOLED_SCAN_DISPLAY_COLUMNS),
+        "",
+    ]
+    skipped = pooled["skipped_measures"].iloc[0] if "skipped_measures" in pooled.columns else ""
+    if skipped:
+        lines += [f"Measures skipped by the pooled scan: {skipped}.", ""]
+
+    return "\n".join(lines)
+
+
 def _cage_weights(profile: pd.DataFrame) -> pd.DataFrame | None:
     """The per-cage mut/wt composition, via `groups.cage_weights`, or None if empty.
 
@@ -698,6 +865,7 @@ def build_study_report(study: StudyConfig, output: Path, cache_dir: Path | None 
         _quality_control(result),
         _methods(study, result),
         _results(study, result, output),
+        _secondary_pooled_analysis(study, result),
         _safeguards(study, result),
     ]
     text = "\n".join(sections) + "\n"

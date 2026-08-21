@@ -9,10 +9,12 @@ import pytest
 from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
-from neu_oldenlabs.groups import (_COMPARE_COLUMNS, benjamini_hochberg, cage_weights,
-                                  cluster_bootstrap_ci, cluster_bootstrap_g_ci, compare,
+from neu_oldenlabs.groups import (_COMPARE_COLUMNS, _COMPARE_POOLED_COLUMNS,
+                                  benjamini_hochberg, cage_weights, cluster_bootstrap_ci,
+                                  cluster_bootstrap_g_ci, compare, compare_pooled,
                                   count_assignments, exact_stratified_permutation, hedges_g,
-                                  mixed_model, scan, stratified_difference)
+                                  mixed_model, pooled_bootstrap_ci, pooled_permutation, scan,
+                                  scan_pooled, stratified_difference)
 
 # The real study composition: 58616 is 5 wt / 0 mut, 58623 and 66336 are 2 wt / 3 mut,
 # 58627 is 3 wt / 1 mut, 62923 is 1 wt / 1 mut, 58597 is 2 wt / 2 mut.
@@ -346,3 +348,138 @@ def test_scan_returns_expected_columns_when_every_measure_is_skipped():
     assert list(table.columns).count("skipped_measures") == 1
     assert table.empty
     assert table.attrs["skipped_measures"] == ["measure_not_in_profile (absent)"]
+
+
+# ============================================================================
+# Pooled (cage-ignoring) secondary comparison
+# ============================================================================
+
+
+def test_pooled_and_stratified_broadly_agree_with_a_planted_effect_and_no_cage_structure():
+    # A flat dataset with a real planted genotype effect and NO per-cage
+    # offset at all (unlike `study_values`, which always injects one): with
+    # no cage structure to disagree about, pooling cage away must not change
+    # the story -- both analyses have to find the same effect, same
+    # direction, both significant.
+    rng = np.random.default_rng(11)
+    rows = []
+    for cage, (n_wt, n_mut) in COMPOSITION.items():
+        for index in range(n_wt):
+            rows.append({"animal_id": f"{cage}-w{index}", "cage": cage, "genotype": "wt",
+                         "value": rng.normal(0, 1)})
+        for index in range(n_mut):
+            rows.append({"animal_id": f"{cage}-m{index}", "cage": cage, "genotype": "mut",
+                         "value": 4.0 + rng.normal(0, 1)})
+    profile = pd.DataFrame(rows).rename(columns={"value": "distance_cm_all"})
+
+    stratified_row = compare(profile, "distance_cm_all")
+    pooled_row = compare_pooled(profile, "distance_cm_all")
+
+    assert stratified_row["difference"] > 0
+    assert pooled_row["pooled_difference"] > 0
+    assert stratified_row["p_value"] < 0.05
+    assert pooled_row["pooled_p_value"] < 0.05
+
+
+def test_pooled_fires_on_a_single_genotype_cage_confound_the_stratified_test_ignores():
+    # THE demonstration this secondary analysis exists to warn about: no
+    # genotype effect anywhere (every animal's value is either exactly 0 or
+    # exactly 100, and genotype never predicts which), but a large
+    # all-wildtype cage is offset far from the rest. The stratified test is
+    # blind to this by construction: that cage has weight 0 (see
+    # test_an_all_wildtype_cage_has_zero_weight_and_cannot_shift_the_statistic),
+    # and the one mixed cage that does contribute has genuinely identical
+    # mut/wt values, so its within-cage difference is exactly 0 for the
+    # observed labelling AND every permutation -- p == 1.0, deterministically
+    # (same logic as test_identical_values_in_every_cage_give_p_equal_to_one).
+    # The pooled test cannot be blind to it: it has nothing but the raw
+    # genotype means to compare, and the outlier cage's offset loads entirely
+    # onto the pooled wildtype mean (10 of the 15 wildtypes sit in it), well
+    # beyond what a same-sized random relabelling can usually reproduce.
+    rows = (
+        [{"animal_id": f"c1-w{i}", "cage": 1, "genotype": "wt", "value": 100.0}
+         for i in range(10)]
+        + [{"animal_id": f"c2-w{i}", "cage": 2, "genotype": "wt", "value": 0.0}
+           for i in range(5)]
+        + [{"animal_id": f"c2-m{i}", "cage": 2, "genotype": "mut", "value": 0.0}
+           for i in range(10)]
+    )
+    profile = pd.DataFrame(rows).rename(columns={"value": "distance_cm_all"})
+
+    stratified_row = compare(profile, "distance_cm_all")
+    pooled_row = compare_pooled(profile, "distance_cm_all")
+
+    assert stratified_row["p_value"] == 1.0
+    assert pooled_row["pooled_p_value"] < 0.01
+
+
+def test_pooled_permutation_is_reproducible():
+    values = study_values(effect=3.0, seed=5)
+    first = pooled_permutation(values, draws=2000)
+    second = pooled_permutation(values, draws=2000)
+    assert first == second
+
+
+def test_pooled_bootstrap_ci_is_reproducible():
+    values = study_values(effect=3.0, seed=5)
+    first = pooled_bootstrap_ci(values, draws=2000)
+    second = pooled_bootstrap_ci(values, draws=2000)
+    assert first == second
+
+
+def test_pooled_p_is_never_zero_and_never_below_its_floor():
+    values = study_values(effect=50.0, seed=2)
+    p, draws, floor = pooled_permutation(values, draws=2000)
+    assert p > 0.0
+    assert p >= floor
+    assert floor == pytest.approx(1 / (draws + 1))
+
+
+def test_pooled_permutation_needs_both_genotypes_present():
+    all_wt = pd.DataFrame([
+        {"animal_id": "a", "cage": 1, "genotype": "wt", "value": 1.0},
+        {"animal_id": "b", "cage": 1, "genotype": "wt", "value": 2.0},
+    ])
+    with pytest.raises(ValueError, match="at least one mut and one wt"):
+        pooled_permutation(all_wt)
+
+
+def test_compare_pooled_columns_constant_matches_compare_pooleds_actual_return_keys():
+    # `_COMPARE_POOLED_COLUMNS` is a hand-maintained duplicate of
+    # compare_pooled()'s return keys, kept so an all-skipped pooled scan can
+    # still return a frame with the right shape. `compare_pooled` asserts
+    # this on every call; this test pins it down directly.
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    row = compare_pooled(profile, "distance_cm_all")
+    assert list(row.keys()) == _COMPARE_POOLED_COLUMNS
+
+
+def test_pooled_columns_are_never_confusable_with_stratified_columns():
+    # Every pooled column past measure/n_mut/n_wt must be `pooled_`-prefixed
+    # so a pooled row can never be mistaken for a stratified one when the two
+    # tables sit side by side (see the module note in groups.py).
+    shared = {"measure", "n_mut", "n_wt"}
+    for column in _COMPARE_POOLED_COLUMNS:
+        assert column in shared or column.startswith("pooled_"), column
+
+
+def test_scan_pooled_returns_expected_columns_when_every_measure_is_skipped():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    table = scan_pooled(profile, ["measure_not_in_profile"])
+    assert list(table.columns).count("pooled_p_adjusted_bh") == 1
+    assert list(table.columns).count("skipped_measures") == 1
+    assert table.empty
+    assert table.attrs["skipped_measures"] == ["measure_not_in_profile (absent)"]
+
+
+def test_scan_pooled_ranks_by_pooled_p_value_and_bh_corrects():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    profile["second_measure"] = profile["distance_cm_all"] + \
+        np.random.default_rng(9).normal(0, 50, len(profile))
+    table = scan_pooled(profile, ["distance_cm_all", "second_measure"])
+    assert list(table["pooled_p_value"]) == sorted(table["pooled_p_value"])
+    assert "pooled_p_adjusted_bh" in table.columns
+    assert len(table) == 2

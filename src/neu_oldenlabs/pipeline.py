@@ -176,6 +176,19 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
         scan_table.attrs["note"] = reason
         pd.DataFrame({"note": [reason]}).to_csv(output / "group_comparison.csv", index=False)
 
+    # SECONDARY, cage-ignoring comparison, run at the study owner's explicit
+    # request ("run analysis not within but all wildtypes and all mutants
+    # irrespectful of where they are coming from") -- see the banner comment
+    # in `groups.py` for what pooling away cage costs. Computed over the same
+    # measure set as the primary scan, unconditionally: unlike the stratified
+    # scan, this does not need any single cage to house both genotypes (it
+    # ignores cage entirely), only the study as a whole to contain both
+    # genotypes -- `groups.scan_pooled` skips, per-measure, with a recorded
+    # reason, exactly like `groups.scan` does when that is not the case (e.g.
+    # `all_wildtype_study`, which has zero mutants at all).
+    scan_table_pooled = groups.scan_pooled(profile_table, measures)
+    scan_table_pooled.to_csv(output / "group_comparison_pooled.csv", index=False)
+
     daily_table.to_csv(output / "daily_measures.csv", index=False)
     profile_table.to_csv(output / "animal_profile.csv", index=False)
     for name, table in qc_tables.items():
@@ -212,6 +225,7 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
     return {
         "long": masked_long, "native_long": native_masked_long, "daily": daily_table,
         "profile": profile_table, "qc": qc_tables, "scan": scan_table,
+        "scan_pooled": scan_table_pooled,
         "missing_cages": study.missing_cages, "excluded_tags": excluded_table,
         "resample_bin_s": study.resample_bin_s, "resampled_cages": resampled_cages,
     }

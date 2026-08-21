@@ -402,3 +402,243 @@ def scan(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
     table["p_adjusted_bh"] = benjamini_hochberg(table["p_value"].to_numpy())
     table["skipped_measures"] = "; ".join(skipped)
     return table.sort_values("p_value").reset_index(drop=True)
+
+
+# ============================================================================
+# SECONDARY, cage-ignoring ("pooled") comparison
+# ============================================================================
+#
+# Added at the study owner's explicit request: "Can you also run analysis not
+# within but all wildtypes and all mutants irrespectful of where they are
+# coming from" -- i.e. pool all wildtype animals against all mutant animals,
+# ignoring cage entirely.
+#
+# This is a DIFFERENT ESTIMAND from every function above, and a WEAKER one.
+# Every function above permutes genotype labels only WITHIN a cage precisely
+# because a cage is a confound -- cages differ in housing, cohort, and (for
+# the dyadic measures) which genotypes the cage-mates carry, for reasons that
+# have nothing to do with genotype. The functions below discard that
+# safeguard on purpose: they pool every animal's value into one wildtype mean
+# and one mutant mean, cage identity dropped, and so CANNOT separate a
+# genotype effect from a cage effect. If a cage houses only one genotype (the
+# real study's cage 58616: 5 wildtype, 0 mutant), every idiosyncrasy of that
+# cage -- housing, cohort, whatever -- is baked into the wildtype mean here
+# with nothing to net it against, and a pooled "significant" result may be
+# entirely a cage effect wearing a genotype label. This is a SECONDARY,
+# hypothesis-generating comparison, never a replacement for the cage-
+# stratified analysis above; read it only alongside the stratified result,
+# and prefer the stratified one wherever they disagree.
+#
+# Every name below is prefixed `pooled_` (or, for the scan table, every new
+# column is prefixed `pooled_`) so a pooled row or column can never be
+# confused with a stratified one when the two tables sit side by side.
+
+
+def pooled_difference(values: pd.DataFrame) -> float:
+    """mean(mut) - mean(wt) over every animal in `values`, cage ignored entirely.
+
+    This is NOT `stratified_difference`: it does not weight or centre by cage,
+    so a cage effect confounded with genotype (e.g. an all-wildtype cage that
+    happens to run high or low) shifts this number exactly as if it were a
+    genotype effect. See the module note above.
+    """
+    frame = _split(values)
+    mut = frame.loc[frame["genotype"] == "mut", "value"].to_numpy(dtype=float)
+    wt = frame.loc[frame["genotype"] == "wt", "value"].to_numpy(dtype=float)
+    return float(mut.mean() - wt.mean())
+
+
+def pooled_permutation(values: pd.DataFrame, draws: int = 100_000,
+                       ) -> tuple[float, int, float]:
+    """Monte Carlo (not exact) two-sided permutation test, cage ignored entirely.
+
+    The real study's composition (15 wildtype, 10 mutant) admits C(25, 10) =
+    3,268,760 label assignments -- too many to enumerate exactly for every
+    measure in a multi-measure scan, so this SHUFFLES genotype labels across
+    ALL animals (cage ignored) `draws` times instead of enumerating them.
+    Seeded from `neu_oldenlabs.RNG_SEED`, so two calls on the same input
+    produce identical output.
+
+    Ties count as extreme (an exactly-equal shuffle is not evidence against
+    the null) and p is computed as `(extreme + 1) / (draws + 1)` -- the
+    observed labelling is itself always one of the "draws" that could occur,
+    which is also why this can never read exactly 0. `min_attainable_p` is
+    `1 / (draws + 1)`, the smallest value this Monte Carlo procedure can ever
+    report, and is returned rather than assumed so a caller need not
+    recompute it from `draws`.
+
+    Like every function in this section, this ignores cage entirely: it
+    cannot distinguish a genotype effect from a cage effect confounded with
+    genotype. See the module note above.
+    """
+    frame = _split(values)
+    array = frame["value"].to_numpy(dtype=float)
+    is_mut = (frame["genotype"] == "mut").to_numpy()
+    n_mut = int(is_mut.sum())
+    n = len(array)
+    if n_mut == 0 or n_mut == n:
+        raise ValueError("pooled permutation needs at least one mut and one wt animal")
+
+    observed = abs(float(array[is_mut].mean() - array[~is_mut].mean()))
+
+    # Vectorised: one random value per (draw, animal) cell, argsort along the
+    # animal axis gives `draws` independent random permutations of the animal
+    # index at once -- a Python loop over 100k draws x 70 measures would be
+    # far too slow (see the module docstring / spec).
+    rng = np.random.default_rng(RNG_SEED)
+    random_grid = rng.random((draws, n))
+    order = np.argsort(random_grid, axis=1)
+    shuffled = array[order]
+    mut_draws = shuffled[:, :n_mut]
+    wt_draws = shuffled[:, n_mut:]
+    diffs = np.abs(mut_draws.mean(axis=1) - wt_draws.mean(axis=1))
+
+    extreme = int(np.sum(diffs >= observed - 1e-12))
+    p_value = (extreme + 1) / (draws + 1)
+    min_attainable_p = 1.0 / (draws + 1)
+    return p_value, draws, min_attainable_p
+
+
+def pooled_hedges_g(values: pd.DataFrame) -> float:
+    """Conventional pooled-SD Hedges' g over every animal, cage ignored entirely.
+
+    Deliberately NOT cage-centred -- unlike `hedges_g`, which restricts to
+    contributing (genotype-mixed) cages and pools within-genotype variance
+    only across those, this pools every mut and every wt animal directly.
+    That is the whole point of this secondary analysis: it describes the
+    conventional, cage-blind effect size an all-wildtype and all-mutant pool
+    would report, cage confounds included. Uses the same small-sample
+    correction (`1 - 3/(4N-9)`) as `hedges_g`.
+    """
+    frame = _split(values)
+    mut = frame.loc[frame["genotype"] == "mut", "value"].to_numpy(dtype=float)
+    wt = frame.loc[frame["genotype"] == "wt", "value"].to_numpy(dtype=float)
+    if len(mut) < 2 or len(wt) < 2:
+        return float("nan")  # a within-genotype variance needs at least 2 animals
+    pooled_ss = (len(mut) - 1) * mut.var(ddof=1) + (len(wt) - 1) * wt.var(ddof=1)
+    pooled_df = (len(mut) - 1) + (len(wt) - 1)
+    pooled_sd = np.sqrt(pooled_ss / pooled_df)
+    if pooled_sd == 0:
+        return float("nan")
+    n_total = len(mut) + len(wt)
+    d = (mut.mean() - wt.mean()) / pooled_sd
+    correction = 1 - 3 / (4 * n_total - 9)
+    return float(d * correction)
+
+
+def pooled_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
+                        level: float = 0.95) -> tuple[float, float]:
+    """Percentile bootstrap CI for `pooled_difference`, resampling ANIMALS within
+    genotype -- NOT cages, unlike `cluster_bootstrap_ci`. Seeded from
+    `neu_oldenlabs.RNG_SEED`, so two calls on the same input are identical.
+
+    Resampling animals directly (rather than cages, then animals within cage)
+    is consistent with this analysis pooling cage away in the first place --
+    there is no cage structure left here to resample. See the module note
+    above for what that costs.
+    """
+    frame = _split(values)
+    mut = frame.loc[frame["genotype"] == "mut", "value"].to_numpy(dtype=float)
+    wt = frame.loc[frame["genotype"] == "wt", "value"].to_numpy(dtype=float)
+    if len(mut) == 0 or len(wt) == 0:
+        raise ValueError("pooled bootstrap needs at least one mut and one wt animal")
+
+    rng = np.random.default_rng(RNG_SEED)
+    mut_draws = rng.choice(mut, size=(draws, len(mut)), replace=True)
+    wt_draws = rng.choice(wt, size=(draws, len(wt)), replace=True)
+    diffs = mut_draws.mean(axis=1) - wt_draws.mean(axis=1)
+
+    tail = (1 - level) / 2
+    return float(np.quantile(diffs, tail)), float(np.quantile(diffs, 1 - tail))
+
+
+def compare_pooled(profile: pd.DataFrame, measure: str) -> dict:
+    """The pooled, cage-ignoring counterpart to `compare`.
+
+    SECONDARY analysis, run at the study owner's explicit request -- see the
+    module note above for what pooling away cage costs: this cannot separate
+    a genotype effect from a cage effect, and an all-wildtype (or all-mutant)
+    cage's idiosyncrasies land entirely in that genotype's pooled mean.
+
+    Every column is prefixed `pooled_` (except `measure`, `n_mut`, `n_wt`,
+    which name the same quantity as `compare`'s and are kept unprefixed so
+    the two tables can be joined on them) precisely so a pooled row can never
+    be confused with a stratified one when the two sit side by side.
+    """
+    values = profile[["animal_id", "cage", "genotype", measure]].rename(
+        columns={measure: "value"}).dropna(subset=["value"])
+    frame = _split(values)
+    n_mut = int((frame["genotype"] == "mut").sum())
+    n_wt = int((frame["genotype"] == "wt").sum())
+    if n_mut == 0 or n_wt == 0:
+        raise ValueError(
+            f"{measure}: pooled comparison needs at least one mut and one wt animal")
+
+    p_value, draws, floor = pooled_permutation(values)
+    low, high = pooled_bootstrap_ci(values)
+
+    row = {
+        "measure": measure,
+        "n_mut": n_mut,
+        "n_wt": n_wt,
+        "pooled_mean_mut": float(frame.loc[frame["genotype"] == "mut", "value"].mean()),
+        "pooled_mean_wt": float(frame.loc[frame["genotype"] == "wt", "value"].mean()),
+        "pooled_difference": pooled_difference(values),
+        "pooled_ci_low": low, "pooled_ci_high": high,
+        "pooled_hedges_g": pooled_hedges_g(values),
+        "pooled_p_value": p_value, "pooled_draws": draws,
+        "pooled_min_attainable_p": floor,
+    }
+    assert list(row.keys()) == _COMPARE_POOLED_COLUMNS, (
+        "_COMPARE_POOLED_COLUMNS (the hand-maintained duplicate used to give an "
+        "all-skipped pooled scan the right shape) has drifted out of sync with the "
+        f"keys compare_pooled() actually returns: {list(row.keys())} != "
+        f"{_COMPARE_POOLED_COLUMNS}")
+    return row
+
+
+# The columns `compare_pooled` produces, in order -- kept alongside
+# `scan_pooled` so an all-skipped pooled scan can still return a frame with
+# the right shape. `compare_pooled` asserts its own return keys match this
+# list on every call, so the two cannot silently drift apart. Every column
+# past `n_wt` is prefixed `pooled_` so it can never be confused with a
+# stratified column when the two tables sit side by side.
+_COMPARE_POOLED_COLUMNS = [
+    "measure", "n_mut", "n_wt",
+    "pooled_mean_mut", "pooled_mean_wt", "pooled_difference",
+    "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
+    "pooled_p_value", "pooled_draws", "pooled_min_attainable_p",
+]
+
+
+def scan_pooled(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
+    """Run `compare_pooled` over every measure and rank by pooled p-value.
+
+    Mirrors `scan`'s shape and skip behaviour exactly (absent/constant/no-
+    contributing-animals measures are skipped with a reason, not silently
+    dropped), but for the SECONDARY, cage-ignoring comparison -- see the
+    module note above. BH correction is applied over the same scanned set,
+    in its own `pooled_p_adjusted_bh` column so it cannot be confused with
+    the stratified scan's `p_adjusted_bh`.
+    """
+    rows, skipped = [], []
+    for measure in measures:
+        if measure not in profile.columns:
+            skipped.append(f"{measure} (absent)")
+            continue
+        if profile[measure].nunique(dropna=True) <= 1:
+            skipped.append(f"{measure} (constant)")
+            continue
+        try:
+            rows.append(compare_pooled(profile, measure))
+        except ValueError as error:
+            skipped.append(f"{measure} ({error})")
+    if not rows:
+        table = pd.DataFrame(
+            columns=_COMPARE_POOLED_COLUMNS + ["pooled_p_adjusted_bh", "skipped_measures"])
+        table.attrs["skipped_measures"] = skipped
+        return table
+    table = pd.DataFrame(rows)
+    table["pooled_p_adjusted_bh"] = benjamini_hochberg(table["pooled_p_value"].to_numpy())
+    table["skipped_measures"] = "; ".join(skipped)
+    return table.sort_values("pooled_p_value").reset_index(drop=True)
