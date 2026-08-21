@@ -173,7 +173,37 @@ def _quality_control(result: dict) -> str:
         lines += ["**Missing values.** No non-numeric values were found in any "
                  "loaded export.", ""]
 
+    lines += [_excluded_tags_paragraph(result["qc"].get("excluded_tags")), ""]
+
     return "\n".join(lines)
+
+
+def _excluded_tags_paragraph(excluded: pd.DataFrame | None) -> str:
+    """Name any export tag not listed in the animal CSV and why it was dropped.
+
+    Per the study owner's ruling (`animals.check_join`), the animal CSV is the
+    sole authority on which animals exist: a tag present in an export but not
+    listed there is not a tracked animal -- it may be an animal removed from
+    the cage or one whose ear tag was lost -- and is kept out of group
+    analysis entirely, regardless of how much data it carries. This must be
+    stated, not left for a reader to notice the animal counts do not match the
+    raw export.
+    """
+    if excluded is None or excluded.empty:
+        return ("**Excluded tags.** Every tag present in a loaded export is listed "
+                "in the animal CSV; no tag was excluded from analysis.")
+    parts = [f"cage {int(row.cage)} tag {int(row.tag)} "
+             f"({row.missing_fraction:.1%} of {int(row.bins)} bins missing)"
+             for row in excluded.itertuples()]
+    return (
+        f"**Excluded tags.** {len(excluded)} tag(s) appear in a loaded export but are "
+        "NOT listed in the animal CSV, per the study owner's ruling that the CSV is "
+        "the sole authority on which animals exist -- each may be an animal removed "
+        "from the cage or one whose ear tag was lost and buried to the ground. These "
+        "are excluded from all analysis (profile, statistics, figures) regardless of "
+        "how much data they carry, and never reach `build_profile`: "
+        + "; ".join(parts) + ". See `qc_excluded_tags.csv` for the full table."
+    )
 
 
 def _count_kind_measures(measures: list[str]) -> list[str]:
@@ -220,8 +250,16 @@ def _bin_timing_sentence(result: dict) -> str:
     and the gap between consecutive bin starts are two different quantities. The
     real cage-58616 export has a constant 600 s span for every bin but an
     irregular cadence (most gaps 10 minutes, some 11, a few 9), so this must be
-    generated from `result["long"]` rather than asserted, and the two quantities
-    must stay distinct in the sentence.
+    generated from `result["native_long"]` rather than asserted, and the two
+    quantities must stay distinct in the sentence.
+
+    Deliberately reads `result["native_long"]` (the rack-masked frame BEFORE
+    any `resample_bin_s` re-binning), not `result["long"]` (which is
+    post-resampling when resampling is configured): this sentence describes
+    what actually arrived from Oldenlabs, per the pipeline's own rule that QC
+    and bin-width reporting describe the raw data, not the analysis
+    resolution. The resampling itself, when in effect, is stated separately
+    (see `_resampling_sentence`).
 
     Cadence is judged PER CAGE, against that cage's own modal gap -- the real
     study mixes a 10-minute-cadence cage (58616) with five 60-minute-cadence
@@ -233,7 +271,7 @@ def _bin_timing_sentence(result: dict) -> str:
     `qc.recording_breaks` already uses this per-cage-relative pattern for the
     same reason.
     """
-    long = result["long"]
+    long = result["native_long"]
     if long.empty:
         return "No bins were loaded in this run, so bin span and cadence cannot be described."
 
@@ -299,6 +337,44 @@ def _bin_timing_sentence(result: dict) -> str:
     return span_line + " " + cadence_line
 
 
+def _resampling_sentence(result: dict) -> str:
+    """State whether `resample_bin_s` is in effect, its target width, and which
+    cages it actually changed.
+
+    Per the study owner's ruling ("downsample minutely to hourly ... keep the
+    analysis to hourly at this moment"), a study configured with
+    `resample_bin_s` re-bins every cage's masked frame to that common,
+    clock-aligned width before any metric is computed (`metrics.resample_bins`),
+    so the daily/circadian family and every figure see one resolution even
+    when the raw exports do not (the real study: cage 58616 at 600 s, the
+    other five at 3600 s). `resampled_cages` (from `pipeline.run_study`) names
+    only the cages whose NATIVE width actually differed from the target --
+    a cage already at the target width is technically resampled too but that
+    is a no-op in value terms, so it is not named as "re-binned" here.
+    """
+    bin_s = result.get("resample_bin_s")
+    if bin_s is None:
+        return ("**Resampling.** `resample_bin_s` is not set for this run: every "
+                "cage's native bin width is used as-is, and no re-binning was applied.")
+    resampled = result.get("resampled_cages") or []
+    if resampled:
+        cages_line = ", ".join(str(c) for c in resampled)
+        detail = (f"Cage(s) actually re-binned (native width differed from the target): "
+                  f"{cages_line}.")
+    else:
+        detail = ("No loaded cage's native width differed from the target, so this "
+                  "run's resampling was a no-op in value terms for every cage.")
+    return (
+        f"**Resampling.** Every cage's masked frame was downsampled to a common, "
+        f"clock-aligned {bin_s} s bin width (`resample_bin_s` = {bin_s} in the study "
+        f"configuration) before any metric (daily aggregation, the circadian family, "
+        f"every figure) was computed. {detail} Aggregation follows the same "
+        f"duration-weighted, presence-aware rule as every other aggregation step in "
+        f"this pipeline (`metrics.resample_bins`): a target bin with no present "
+        f"source bin is NaN, never 0.0."
+    )
+
+
 def _methods(study: StudyConfig, result: dict) -> str:
     scan = result["scan"]
     # Every measure column ACTUALLY REPORTED in the profile table -- not just
@@ -331,6 +407,8 @@ def _methods(study: StudyConfig, result: dict) -> str:
         "Counts (see below) become a rate per valid hour, so a day that lost bins to "
         "the rack mask is not scored as a day of low activity. Bins where "
         "`Cage in rack == 0` are excluded from every metric before aggregation.",
+        "",
+        _resampling_sentence(result),
         "",
         per_hour_line,
         "",

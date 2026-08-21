@@ -368,19 +368,24 @@ def daily_trajectories(daily: pd.DataFrame, output: Path, measure: str) -> None:
 
 def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
     """One row per cage: fraction of bins out of rack, breaks, range violations,
-    coverage, and fraction of values missing (NaN) -- plus bin width, called
-    out explicitly because a mixed-resolution study must be stated, not
-    silently averaged: pooling a 600-second-bin cage with a 3600-second-bin
-    cage in a per-bin figure would manufacture a difference that is pure bin
-    width (see `actogram`, `phase_profiles`).
+    coverage, fraction of values missing (NaN), and excluded (non-CSV-listed)
+    tags -- plus bin width, called out explicitly because a mixed-resolution
+    study must be stated, not silently averaged: pooling a 600-second-bin cage
+    with a 3600-second-bin cage in a per-bin figure would manufacture a
+    difference that is pure bin width (see `actogram`, `phase_profiles`).
 
     Built from the `qc.qc_tables` outputs, folded into one per-cage summary
     so the figure and its CSV both describe "how much can I trust this
-    cage's data" at a glance.
+    cage's data" at a glance. `excluded_tags` (from `qc.excluded_tag_table`,
+    via `animals.check_join`'s asymmetric join rule) is a count of tags per
+    cage that were present in the export but not listed in the animal CSV,
+    and were therefore excluded from every other table and figure here --
+    this panel is the one place their existence is visible in a figure.
     """
     rack, regularity, breaks, coverage, ranges, missing = (
         qc["rack"], qc["regularity"], qc["breaks"], qc["coverage"], qc["ranges"],
         qc["missing"])
+    excluded = qc.get("excluded_tags", pd.DataFrame(columns=["cage", "tag"]))
 
     cages = sorted(rack["cage"].unique()) if not rack.empty else []
     fraction_out = (rack.groupby("cage")["fraction_out"].mean().reindex(cages).fillna(0.0))
@@ -393,6 +398,8 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
     fraction_missing = (
         (missing.groupby("cage")["missing"].sum() / missing.groupby("cage")["bins"].sum())
         .reindex(cages).fillna(0.0) if not missing.empty else pd.Series(0.0, index=cages))
+    n_excluded = (excluded.groupby("cage").size().reindex(cages).fillna(0).astype(int)
+                 if not excluded.empty else pd.Series(0, index=cages, dtype=int))
 
     bin_widths = {}
     if not regularity.empty:
@@ -407,6 +414,7 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
         "n_range_violations": n_violations.to_numpy(),
         "mean_valid_hours_per_day": valid_hours.to_numpy(),
         "mean_fraction_missing_values": fraction_missing.to_numpy(),
+        "n_excluded_tags": n_excluded.to_numpy(),
         "bin_width_s": [bin_width_label.get(cage, "") for cage in cages],
     })
 
@@ -415,7 +423,8 @@ def qc_panel(qc: dict[str, pd.DataFrame], output: Path) -> None:
              ("n_recording_breaks", "recording breaks (relative to cage's own bin width)"),
              ("n_range_violations", "out-of-range values"),
              ("mean_valid_hours_per_day", "mean valid hours / day"),
-             ("mean_fraction_missing_values", "fraction of values missing (NaN)")]
+             ("mean_fraction_missing_values", "fraction of values missing (NaN)"),
+             ("n_excluded_tags", "tags excluded (not in animal CSV)")]
     x = np.arange(len(cages))
     flat_axes = axes.flat
     for (column, title), ax in zip(panels, flat_axes):

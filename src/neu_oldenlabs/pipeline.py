@@ -2,19 +2,37 @@
 
 Ordering matters and is deliberate, not incidental:
 
-1. Animals are loaded once and checked against every cage's tags as it loads,
-   so a mismatched export fails before anything downstream is computed.
-2. `qc.qc_tables` runs on the RAW (unmasked) long frame -- the rack mask is
-   itself one of the things QC reports on, so QC must see the bins it excludes.
-3. Everything past QC (daily aggregation, the circadian profile) runs on the
-   rack-masked frame, because an out-of-rack bin is not an observation of the
-   animal's behaviour.
-4. The animal table is filtered to the cages actually loaded before
+1. Animals are loaded once and checked against every cage's tags as it loads.
+   `animals.check_join` is ASYMMETRIC (study owner's ruling: the animal CSV is
+   the sole authority on which animals exist): a tag the CSV lists but the
+   export lacks is a genuine discrepancy and raises; a tag the export carries
+   but the CSV does not list is an untracked/phantom slot, returned rather
+   than raised on, and is EXCLUDED from the frame before anything else in this
+   function runs -- it never reaches QC, the rack mask, resampling, or
+   `build_profile`. It is still reported: `qc.excluded_tag_table` -- computed
+   on the unfiltered export data -- becomes the `excluded_tags` entry in
+   `qc_tables`, written as a CSV like every other QC table.
+2. `qc.qc_tables` runs on the RAW (unmasked, un-resampled, phantom-tag-free)
+   long frame -- the rack mask is itself one of the things QC reports on, so QC
+   must see the bins it excludes, and bin-width reporting / the missing-value
+   audit must describe what actually arrived, before any resampling changes it.
+3. The rack mask is applied next, on NATIVE bins, because an out-of-rack bin is
+   not an observation of the animal's behaviour and must not contribute to a
+   resampled value either.
+4. If the study configures `resample_bin_s`, every cage's rack-masked frame is
+   then re-binned to that common clock-aligned width (`metrics.resample_bins`)
+   -- so a mixed-resolution study (the real study: cage 58616 at 600 s, the
+   other five at 3600 s) becomes one resolution before ANY metric is computed.
+   The `in_rack` mask itself is never resampled -- it no longer exists in the
+   frame by this point, having already done its job in step 3.
+5. Everything past that (daily aggregation, the circadian profile) runs on the
+   masked, possibly-resampled frame.
+6. The animal table is filtered to the cages actually loaded before
    `build_profile` is called. `build_profile` enforces a TOTAL join across the
    daily table, the circadian table, and the animal table; the study's animal
    CSV can list cages whose export has not arrived, and reconciling that is
    this function's job, not `build_profile`'s.
-5. `groups.scan` is skipped -- with a recorded reason, not silently -- when no
+7. `groups.scan` is skipped -- with a recorded reason, not silently -- when no
    loaded cage contains both genotypes. A single-genotype study is an expected
    RESULT (an early cohort, a missing export), not an error.
 """
@@ -60,6 +78,20 @@ def _default_scan_measures(profile_table: pd.DataFrame) -> list[str]:
     return [c for c in profile_table.columns if c not in IDENTITY and c != "acrophase_hour"]
 
 
+def _cages_actually_resampled(regularity: pd.DataFrame, bin_s: int) -> list[int]:
+    """Cages whose native bin width(s) differ from the resampling target.
+
+    A cage already natively at ``bin_s`` is technically passed through
+    `metrics.resample_bins` too, but that is a no-op in value terms, so it is
+    not "actually re-binned" and should not be reported as such.
+    """
+    changed = []
+    for cage, block in regularity.groupby("cage"):
+        if set(block["duration_s"]) != {float(bin_s)}:
+            changed.append(cage)
+    return sorted(changed)
+
+
 def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -> dict:
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -68,16 +100,39 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
 
     long_frames = []
     export_paths = []
+    excluded_pairs: list[tuple[int, int]] = []
     for spec in study.available_cages:
         cage_long = io.load_cage_cached(spec.export, spec.cage, cache_dir)
-        animals_mod.check_join(animal_table, spec.cage, set(cage_long["tag"].tolist()))
+        excluded_tags = animals_mod.check_join(
+            animal_table, spec.cage, set(cage_long["tag"].tolist()))
+        excluded_pairs.extend((spec.cage, tag) for tag in excluded_tags)
         long_frames.append(cage_long)
         export_paths.append(spec.export)
 
-    raw_long = pd.concat(long_frames, ignore_index=True)
+    full_long = pd.concat(long_frames, ignore_index=True)
+
+    # The excluded-tags QC table is built from the UNFILTERED export data --
+    # this is the one place a phantom tag's data is still read -- before it is
+    # dropped from every frame everything else in this function sees.
+    excluded_table = qc.excluded_tag_table(full_long, excluded_pairs)
+    if excluded_pairs:
+        excluded_keys = pd.DataFrame(sorted(set(excluded_pairs)), columns=["cage", "tag"])
+        raw_long = full_long.merge(
+            excluded_keys.assign(_excluded=True), on=["cage", "tag"], how="left")
+        raw_long = raw_long[raw_long["_excluded"].isna()].drop(columns="_excluded")
+        raw_long = raw_long.reset_index(drop=True)
+    else:
+        raw_long = full_long
 
     qc_tables = qc.qc_tables(raw_long)
-    masked_long = qc.apply_rack_mask(raw_long)
+    qc_tables["excluded_tags"] = excluded_table
+    native_masked_long = qc.apply_rack_mask(raw_long)
+
+    masked_long = native_masked_long
+    resampled_cages: list[int] = []
+    if study.resample_bin_s is not None:
+        resampled_cages = _cages_actually_resampled(qc_tables["regularity"], study.resample_bin_s)
+        masked_long = metrics.resample_bins(masked_long, study.resample_bin_s)
 
     daily_table = metrics.daily(masked_long, study.lights_on, study.lights_off)
     daily_table = metrics.drop_habituation(daily_table, study.habituation_days)
@@ -150,10 +205,13 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
             "min_days": study.min_days, "window_start": study.window_start,
             "window_end": study.window_end, "primary_measures": list(study.primary_measures),
             "scan_measures": list(study.scan_measures),
+            "resample_bin_s": study.resample_bin_s,
         },
     )
 
     return {
-        "long": masked_long, "daily": daily_table, "profile": profile_table,
-        "qc": qc_tables, "scan": scan_table, "missing_cages": study.missing_cages,
+        "long": masked_long, "native_long": native_masked_long, "daily": daily_table,
+        "profile": profile_table, "qc": qc_tables, "scan": scan_table,
+        "missing_cages": study.missing_cages, "excluded_tags": excluded_table,
+        "resample_bin_s": study.resample_bin_s, "resampled_cages": resampled_cages,
     }
