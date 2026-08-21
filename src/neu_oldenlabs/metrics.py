@@ -115,6 +115,43 @@ def restrict_window(table: pd.DataFrame, start=None, end=None) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def hourly_by_animal(long: pd.DataFrame, measure: str) -> pd.DataFrame:
+    """One duration-weighted value per animal, per clock hour (0-23), pooling
+    bins across every calendar date that shares the hour-of-day.
+
+    Applies the same per-measure-kind rule as `_aggregate_measure` (rate/mean:
+    duration-weighted mean; max: the maximum; count: a rate per valid hour),
+    so an hour built from a 600 s-bin cage and an hour built from a 3600 s-bin
+    cage are on the same footing -- see the module docstring -- and averages
+    across days BEFORE any statistic sees the data. Returns one row per
+    (cage, tag, hour); an animal missing every bin at some hour simply has no
+    row for that hour, and a caller reindexing to the full 0..23 range gets
+    NaN there rather than a fabricated 0.
+
+    `long` may already be filtered to one `measure`, or may carry several --
+    only rows matching `measure` are used if a `measure` column is present.
+    """
+    frame = long[long["measure"] == measure].copy() if "measure" in long.columns else long.copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["cage", "tag", "hour", "value"])
+    kind = MEASURE_KIND[measure]
+    frame["hour"] = frame["bin_start"].dt.hour
+    frame["weighted"] = frame["value"] * frame["duration_s"]
+    frame["duration_present"] = frame["duration_s"].where(frame["value"].notna(), 0.0)
+    grouped = frame.groupby(["cage", "tag", "hour"], as_index=False).agg(
+        weighted=("weighted", "sum"), seconds=("duration_present", "sum"),
+        total=("value", "sum"), peak=("value", "max"))
+    if kind in ("rate", "mean"):
+        grouped["value"] = grouped["weighted"] / grouped["seconds"].replace(0, np.nan)
+    elif kind == "max":
+        grouped["value"] = grouped["peak"]
+    elif kind == "count":
+        grouped["value"] = grouped["total"] / (grouped["seconds"] / 3600.0).replace(0, np.nan)
+    else:
+        raise ValueError(f"no aggregation rule for measure kind {kind!r}")
+    return grouped[["cage", "tag", "hour", "value"]]
+
+
 def resample_bins(long: pd.DataFrame, bin_s: int) -> pd.DataFrame:
     """Re-bin a long frame to one common, clock-aligned bin width.
 

@@ -20,6 +20,7 @@ import pandas as pd
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from . import RNG_SEED
+from . import metrics
 
 
 def _split(values: pd.DataFrame) -> pd.DataFrame:
@@ -38,6 +39,21 @@ def cage_weights(values: pd.DataFrame) -> pd.DataFrame:
     total = counts["n_mut"] + counts["n_wt"]
     counts["weight"] = np.where(total > 0, counts["n_mut"] * counts["n_wt"] / total, 0.0)
     return counts
+
+
+def _label_options(n: int, k: int) -> list[np.ndarray]:
+    """Every boolean mask of length `n` with exactly `k` True values.
+
+    Factored out of `exact_stratified_permutation` so `cluster_permutation`
+    (below) can enumerate the identical per-cage label options without
+    duplicating the combinatorics.
+    """
+    options = []
+    for pick in combinations(range(n), k):
+        mask = np.zeros(n, dtype=bool)
+        mask[list(pick)] = True
+        options.append(mask)
+    return options
 
 
 def _difference_from_labels(cage_values: dict, labels: dict, weights: dict) -> float:
@@ -89,12 +105,7 @@ def exact_stratified_permutation(values: pd.DataFrame) -> tuple[float, int, floa
     per_cage = []
     for cage in cages:
         n, k = len(cage_values[cage]), int(observed[cage].sum())
-        options = []
-        for pick in combinations(range(n), k):
-            mask = np.zeros(n, dtype=bool)
-            mask[list(pick)] = True
-            options.append(mask)
-        per_cage.append(options)
+        per_cage.append(_label_options(n, k))
 
     extreme = total = 0
     for combination in product(*per_cage):
@@ -399,6 +410,435 @@ def scan(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
         table.attrs["skipped_measures"] = skipped
         return table
     table = pd.DataFrame(rows)
+    table["p_adjusted_bh"] = benjamini_hochberg(table["p_value"].to_numpy())
+    table["skipped_measures"] = "; ".join(skipped)
+    return table.sort_values("p_value").reset_index(drop=True)
+
+
+# ============================================================================
+# Cage-stratified, cluster-based permutation test over the 24-hour profile
+# ============================================================================
+#
+# The study owner looked at the `phase_profiles` figure -- mutant and wildtype
+# hourly curves separating, with non-overlapping SEM bands -- and asked how to
+# test that properly. Testing 24 clock hours with 24 separate tests is wrong
+# twice over: adjacent hours are strongly autocorrelated, and 24 tests times
+# every scanned measure is a large multiplicity burden. Non-overlapping SEM
+# bands are NOT themselves a test: bars that just touch correspond to roughly
+# p ~= 0.3, not p ~= 0.05.
+#
+# The tool here is the cluster-based permutation test (Maris & Oostenveld
+# 2007, standard in EEG/MEG for exactly this "many correlated time points"
+# problem), adapted to this study's cage-stratified design: the per-hour
+# statistic is the SAME weighted within-cage difference `stratified_difference`
+# uses (reusing `_difference_from_labels` for the observed value), and the
+# null is within-cage label permutation, exactly as `exact_stratified_permutation`
+# enumerates it.
+
+HOURS_PER_DAY = 24
+CLUSTER_FORMING_THRESHOLD = 2.0
+CLUSTER_ENUMERATION_CAP = 20_000
+CLUSTER_PERMUTATION_DRAWS = 5000
+
+
+def hourly_profile_by_animal(long: pd.DataFrame, measure: str) -> pd.DataFrame:
+    """Animal x clock-hour table: one row per animal, one column per hour (0..23).
+
+    `long` is the rack-masked (and habituation/window-restricted) bin-level
+    frame joined with genotype -- the same shape `pipeline.run_study` passes
+    to `plots.phase_profiles`. Delegates the within-animal, across-day
+    reduction to `metrics.hourly_by_animal` (duration-weighted per
+    `io.MEASURE_KIND`, the same call `plots._hourly_value_per_animal` makes
+    for the `phase_profiles` figure), so every animal contributes exactly ONE
+    value per clock hour -- averaged across every day it was recorded --
+    before any statistic sees the data. This is the step that prevents
+    pseudoreplication: n in `cluster_permutation` is animals (~25 in the real
+    study), never animal-hours (~27,000).
+
+    Returns columns "animal_id", "cage", "tag", "genotype", then one column
+    per hour, named by the integer hour (0..23). An hour with no bin at all
+    for an animal is NaN, not a fabricated 0 -- `cluster_permutation` drops
+    any animal missing even one hour (see its docstring).
+    """
+    per_animal = metrics.hourly_by_animal(long, measure)
+    identity = long[["cage", "tag", "genotype"]].drop_duplicates()
+    wide = per_animal.pivot(index=["cage", "tag"], columns="hour", values="value")
+    wide = wide.reindex(columns=range(HOURS_PER_DAY))
+    wide = wide.reset_index().merge(identity, on=["cage", "tag"], how="left")
+    wide["animal_id"] = wide["cage"].astype(str) + "-" + wide["tag"].astype(str)
+    ordered = ["animal_id", "cage", "tag", "genotype"] + list(range(HOURS_PER_DAY))
+    return wide[ordered]
+
+
+def _weighted_hourly_difference(cage_arrays: dict, labels: dict, weights: dict) -> np.ndarray:
+    """`_difference_from_labels` generalised to many columns (hours) at once.
+
+    `cage_arrays[cage]` is (n_animals_in_cage, n_columns). Returns the
+    weighted within-cage difference for EVERY column in one array operation
+    -- the identical formula `_difference_from_labels` uses for a single
+    column (a test below checks the two agree), just evaluated for all 24
+    hours together, which is what makes enumerating thousands of within-cage
+    permutations across 24 hours affordable.
+    """
+    n_columns = next(iter(cage_arrays.values())).shape[1]
+    numerator = np.zeros(n_columns)
+    denominator = 0.0
+    for cage, array in cage_arrays.items():
+        weight = weights[cage]
+        if weight == 0:
+            continue
+        is_mut = labels[cage]
+        numerator = numerator + weight * (array[is_mut].mean(axis=0) - array[~is_mut].mean(axis=0))
+        denominator += weight
+    if denominator == 0:
+        return np.full(n_columns, np.nan)
+    return numerator / denominator
+
+
+def _find_clusters(statistic: np.ndarray, threshold: float) -> list:
+    """Contiguous, same-signed runs of hours where |statistic| > threshold,
+    treating the 24 hours as CIRCULAR -- hour 23 is adjacent to hour 0.
+
+    A naive "double the 24-point signal to 48 points, then scan for runs"
+    trick is NOT safe here: it can split one true wrapping cluster into two
+    reported clusters (the wrapped portion, found spanning the doubling
+    seam, AND a spurious duplicate of its non-wrapped tail found again at
+    the very start of the array, since a linear scan has no predecessor for
+    index 0 and so always starts a fresh run there even when hour 0 is
+    really the middle of a run that started at hour 22). This was caught by
+    the midnight-wrap test during development and is why the module test
+    `test_a_wrapping_cluster_is_reported_once_not_twice` exists.
+
+    Correct approach: rotate the 24-point array to start at a genuine
+    boundary -- an index that does NOT continue the run ending at the
+    previous (circularly) index -- so a single ordinary LINEAR scan for
+    same-sign runs cannot be split by, or duplicated across, the array's
+    artificial start/end. Handles the degenerate case where every hour
+    exceeds the threshold with the same sign (no boundary exists at all --
+    the whole circle is one cluster) as a special case first. NaN entries
+    (an hour whose null standard deviation was zero, see
+    `cluster_permutation`) never exceed the threshold and are simply
+    excluded, like any other non-exceeding hour.
+    """
+    n = len(statistic)
+    active = np.abs(statistic) > threshold
+    sign = np.sign(statistic)
+    if not active.any():
+        return []
+    if active.all() and len(set(sign)) == 1:
+        return [{"hours": list(range(n)), "mass": float(statistic.sum()), "sign": int(sign[0])}]
+
+    rotate_at = next(
+        i for i in range(n)
+        if not (active[i] and active[i - 1] and sign[i] == sign[i - 1])
+    )
+    order = [(rotate_at + offset) % n for offset in range(n)]
+    rotated_active = active[order]
+    rotated_sign = sign[order]
+    rotated_stat = statistic[order]
+
+    runs = []
+    start = None
+    for i in range(n):
+        if rotated_active[i] and start is None:
+            start = i
+        elif rotated_active[i] and rotated_sign[i] != rotated_sign[start]:
+            runs.append((start, i - 1))
+            start = i
+        elif not rotated_active[i] and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, n - 1))
+
+    clusters = []
+    for s, e in runs:
+        hours = sorted(order[i] for i in range(s, e + 1))
+        mass = float(rotated_stat[s:e + 1].sum())
+        clusters.append({"hours": hours, "mass": mass, "sign": int(rotated_sign[s])})
+    return clusters
+
+
+def cluster_permutation(hourly: pd.DataFrame, threshold: float = CLUSTER_FORMING_THRESHOLD,
+                        draws: int | None = None) -> dict:
+    """Cage-stratified cluster-based permutation test over the 24-hour profile.
+
+    `hourly` is `hourly_profile_by_animal`'s output (or any frame with the
+    same shape): one row per animal, columns "animal_id", "cage", "genotype",
+    and one column per clock hour (0..23), each animal's value already
+    averaged across days. An animal missing a value at ANY hour is dropped
+    entirely (count kept in the returned dict's `n_animals_dropped`), so
+    every hour compares the SAME set of animals under the SAME cage labels --
+    without that, a permutation's relabelling would not mean the same thing
+    at every hour.
+
+    **Per-hour statistic.** The observed difference at each hour is
+    `_difference_from_labels` -- the SAME weighted within-cage statistic
+    `stratified_difference` uses, weight = n_mut*n_wt/(n_mut+n_wt) per cage
+    -- called once per hour, so the primary test's statistic is reused, not
+    reimplemented. The null distribution (below) uses
+    `_weighted_hourly_difference`, the identical formula generalised to all
+    24 hours in one array operation, which is what makes enumerating
+    thousands of permutations affordable; a test checks the two produce the
+    same number for a spot check.
+
+    **Cluster-forming statistic and threshold -- both DECLARED, not tuned to
+    the data.** Each hour's observed difference is standardised into a
+    z-like statistic using the MEAN and STANDARD DEVIATION of that hour's own
+    difference across the null (within-cage label permutation) distribution:
+    `z_h = (observed_h - null_mean_h) / null_sd_h`. Both are computed ONCE
+    from the same permutation draws used for the cluster-mass null below,
+    then applied identically to the observed data and to every permutation's
+    own recomputed differences when re-clustering it -- so an hour with more
+    between-animal noise cannot spuriously dominate a cluster just because
+    its raw difference happens to be numerically larger. The cluster-forming
+    threshold defaults to `CLUSTER_FORMING_THRESHOLD` = 2.0 (an hour must
+    stand about 2 null standard deviations from its own null mean to seed a
+    cluster); pass `threshold` to use a different one. An hour whose null
+    standard deviation is exactly 0 (every permutation ties there, e.g. a
+    cage-zero-weight-only hour) gets z = NaN and can never exceed threshold.
+
+    **Circularity.** Clock hours are CIRCULAR -- hour 23 is adjacent to hour
+    0 -- so a cluster may wrap midnight; `_find_clusters` handles this
+    explicitly (see its docstring and the module's wrap tests).
+
+    **Null.** Within-cage label permutation, exactly as
+    `exact_stratified_permutation` enumerates it (the same per-cage
+    combinations of which animals are labelled "mut", via `_label_options`):
+    for every permutation, all 24 hourly differences are recomputed, the
+    SAME threshold re-clusters them, and the MAXIMUM absolute cluster mass
+    (0.0 if no cluster forms) is recorded. This design's real-study
+    composition admits exactly 4800 within-cage label assignments -- small
+    enough to enumerate EXACTLY -- so this enumerates exactly whenever the
+    design admits at most `CLUSTER_ENUMERATION_CAP` assignments and `draws`
+    is not given; above that cap, or whenever `draws` is given explicitly,
+    `draws` permutations (default `CLUSTER_PERMUTATION_DRAWS`) are SAMPLED
+    using `neu_oldenlabs.RNG_SEED`, so two calls on the same input are
+    identical. The returned dict's `exact` flag and `n_permutations` state
+    which was done and how many.
+
+    **p-value.** For each OBSERVED cluster, p = (1 + the number of
+    permutations whose maximum absolute cluster mass is >= that cluster's
+    own |mass|) / (1 + n_permutations) -- ties counted as extreme, so p can
+    never be exactly 0 and never falls below 1/(n_permutations+1). Taking
+    the MAXIMUM over clusters (and implicitly over all 24 hours) on every
+    permutation is what corrects for testing 24 hours -- and however many
+    clusters happen to form -- at once, exactly as the max-statistic step
+    does in Maris & Oostenveld (2007).
+
+    Returns a dict: `clusters` (list of {"hours", "sign", "mass", "p"},
+    sorted by ascending p), `n_permutations`, `exact` (bool), `threshold`,
+    `n_animals`, `n_animals_dropped_missing_hour`, `observed_difference` (raw
+    24-length per-hour difference), `observed_z`, `null_mean`, `null_sd`
+    (the 24-length standardisation actually used).
+    """
+    frame = hourly.copy()
+    unexpected = sorted(set(frame["genotype"]) - {"mut", "wt"})
+    if unexpected:
+        raise ValueError(f"genotype must be 'mut' or 'wt', got {unexpected}")
+
+    hour_columns = list(range(HOURS_PER_DAY))
+    missing_columns = [h for h in hour_columns if h not in frame.columns]
+    if missing_columns:
+        raise ValueError(f"hourly profile is missing hour column(s) {missing_columns}")
+
+    complete = frame.dropna(subset=hour_columns).reset_index(drop=True)
+    n_dropped = len(frame) - len(complete)
+    if complete.empty:
+        raise ValueError("no animal has a value at every hour; nothing to test")
+
+    weight_frame = complete[["cage", "genotype"]].copy()
+    weight_frame["value"] = 1.0
+    weights = cage_weights(weight_frame).set_index("cage")["weight"].to_dict()
+    if not any(weight > 0 for weight in weights.values()):
+        raise ValueError("no cage contains both genotypes; nothing to compare")
+
+    cage_arrays: dict = {}
+    observed_labels: dict = {}
+    for cage, block in complete.groupby("cage", sort=True):
+        cage_arrays[cage] = block[hour_columns].to_numpy(dtype=float)
+        observed_labels[cage] = (block["genotype"] == "mut").to_numpy()
+
+    observed_diff = np.array([
+        _difference_from_labels(
+            {cage: array[:, h] for cage, array in cage_arrays.items()},
+            observed_labels, weights)
+        for h in hour_columns
+    ])
+
+    cages = sorted(cage_arrays)
+    per_cage_options = []
+    total = 1
+    for cage in cages:
+        n = cage_arrays[cage].shape[0]
+        k = int(observed_labels[cage].sum())
+        options = _label_options(n, k)
+        per_cage_options.append(options)
+        total *= len(options)
+
+    if draws is None:
+        exact = total <= CLUSTER_ENUMERATION_CAP
+        n_permutations = total if exact else CLUSTER_PERMUTATION_DRAWS
+    else:
+        exact = False
+        n_permutations = draws
+
+    if exact:
+        def _label_iter():
+            for combination in product(*per_cage_options):
+                yield dict(zip(cages, combination))
+    else:
+        rng = np.random.default_rng(RNG_SEED)
+
+        def _label_iter():
+            for _ in range(n_permutations):
+                labels = {}
+                for cage in cages:
+                    n = cage_arrays[cage].shape[0]
+                    k = int(observed_labels[cage].sum())
+                    picked = rng.choice(n, size=k, replace=False)
+                    mask = np.zeros(n, dtype=bool)
+                    mask[picked] = True
+                    labels[cage] = mask
+                yield labels
+
+    null_diffs = np.empty((n_permutations, HOURS_PER_DAY))
+    for index, labels in enumerate(_label_iter()):
+        null_diffs[index] = _weighted_hourly_difference(cage_arrays, labels, weights)
+
+    null_mean = null_diffs.mean(axis=0)
+    null_sd = null_diffs.std(axis=0, ddof=1) if n_permutations > 1 else np.zeros(HOURS_PER_DAY)
+    null_sd_safe = np.where(null_sd > 0, null_sd, np.nan)
+
+    observed_z = (observed_diff - null_mean) / null_sd_safe
+    null_z = (null_diffs - null_mean) / null_sd_safe
+
+    observed_clusters = _find_clusters(observed_z, threshold)
+
+    null_max_abs_mass = np.empty(n_permutations)
+    for index in range(n_permutations):
+        row_clusters = _find_clusters(null_z[index], threshold)
+        null_max_abs_mass[index] = max((abs(c["mass"]) for c in row_clusters), default=0.0)
+
+    clusters = []
+    for cluster in observed_clusters:
+        extreme = int(np.sum(null_max_abs_mass >= abs(cluster["mass"]) - 1e-12))
+        p = (extreme + 1) / (n_permutations + 1)
+        clusters.append({"hours": cluster["hours"], "sign": cluster["sign"],
+                         "mass": cluster["mass"], "p": p})
+    clusters.sort(key=lambda c: c["p"])
+
+    return {
+        "clusters": clusters,
+        "n_permutations": n_permutations,
+        "exact": exact,
+        "threshold": threshold,
+        "n_animals": len(complete),
+        "n_animals_dropped_missing_hour": n_dropped,
+        "observed_difference": observed_diff,
+        "observed_z": observed_z,
+        "null_mean": null_mean,
+        "null_sd": null_sd,
+    }
+
+
+def _format_hour_range(hours: list) -> str:
+    """Render a cluster's hour list as contiguous ranges, wrap-aware.
+
+    e.g. [2, 3, 4, 5, 6] -> "2-6"; [0, 1, 22, 23] -> "22-23,0-1" (the wrap is
+    rendered as two clock-order pieces, not as the numerically sorted, and
+    misleading, "0-1,22-23" or "22-1").
+    """
+    if not hours:
+        return ""
+    ordered = sorted(hours)
+    if len(ordered) == HOURS_PER_DAY:
+        return "0-23 (all hours)"
+
+    # Rotate to start right after the single largest gap (the true "break"
+    # in the circular run), so the walk below never has to cross the wrap
+    # itself -- the wrap, if any, is then represented as a value going from
+    # 23 down to 0 inside one contiguous walk.
+    gaps = [(ordered[i + 1] - ordered[i], i) for i in range(len(ordered) - 1)]
+    wrap_gap = (ordered[0] + HOURS_PER_DAY - ordered[-1], len(ordered) - 1)
+    _, split_index = max(gaps + [wrap_gap], key=lambda item: item[0]) if gaps else wrap_gap
+    rotated = ordered[split_index + 1:] + ordered[:split_index + 1]
+
+    ranges = []
+    start = prev = rotated[0]
+    for hour in rotated[1:]:
+        if hour == (prev + 1) % HOURS_PER_DAY:
+            prev = hour
+            continue
+        ranges.append((start, prev))
+        start = prev = hour
+    ranges.append((start, prev))
+
+    parts = []
+    for a, b in ranges:
+        if a == b:
+            parts.append(f"{a}")
+        elif a <= b:
+            parts.append(f"{a}-{b}")
+        else:  # wraps past midnight
+            parts.append(f"{a}-23,0-{b}")
+    return ",".join(parts)
+
+
+def cluster_permutation_scan(long: pd.DataFrame, measures: list, *,
+                             threshold: float = CLUSTER_FORMING_THRESHOLD,
+                             draws: int | None = None) -> pd.DataFrame:
+    """Run `cluster_permutation` over every measure, one row per observed
+    cluster, BH-corrected ACROSS MEASURES.
+
+    The within-measure correction across the 24 hours is already handled
+    inside `cluster_permutation` itself (the max-cluster-mass step); the BH
+    correction here is layered ACROSS the measures scanned, exactly like
+    `scan`'s `p_adjusted_bh` -- a different multiplicity axis, so both
+    corrections are needed and neither substitutes for the other.
+
+    `long` is the rack-masked (and habituation/window-restricted) bin-level
+    frame joined with genotype, as `hourly_profile_by_animal` expects. A
+    measure absent from `long`, with no cage housing both genotypes, or that
+    raised for any other data reason is recorded in the returned frame's
+    `skipped_measures` attribute rather than raising, mirroring `scan`. A
+    measure with zero observed clusters (nothing exceeded the threshold)
+    contributes no row either, also recorded as skipped.
+    """
+    rows = []
+    skipped = []
+    columns = ["measure", "hours", "n_hours", "sign", "mass", "p_value",
+              "n_permutations", "exact", "threshold"]
+    for measure in measures:
+        if measure not in set(long.get("measure", [])):
+            skipped.append(f"{measure} (absent)")
+            continue
+        hourly = hourly_profile_by_animal(long, measure)
+        try:
+            result = cluster_permutation(hourly, threshold=threshold, draws=draws)
+        except ValueError as error:
+            skipped.append(f"{measure} ({error})")
+            continue
+        if not result["clusters"]:
+            skipped.append(f"{measure} (no cluster exceeded the threshold)")
+            continue
+        for cluster in result["clusters"]:
+            rows.append({
+                "measure": measure,
+                "hours": _format_hour_range(cluster["hours"]),
+                "n_hours": len(cluster["hours"]),
+                "sign": cluster["sign"],
+                "mass": cluster["mass"],
+                "p_value": cluster["p"],
+                "n_permutations": result["n_permutations"],
+                "exact": result["exact"],
+                "threshold": threshold,
+            })
+    if not rows:
+        table = pd.DataFrame(columns=columns + ["p_adjusted_bh", "skipped_measures"])
+        table.attrs["skipped_measures"] = skipped
+        return table
+    table = pd.DataFrame(rows, columns=columns)
     table["p_adjusted_bh"] = benjamini_hochberg(table["p_value"].to_numpy())
     table["skipped_measures"] = "; ".join(skipped)
     return table.sort_values("p_value").reset_index(drop=True)

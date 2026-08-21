@@ -18,7 +18,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
-from . import RNG_SEED
+from . import RNG_SEED, metrics
 from .io import MEASURE_KIND
 
 matplotlib.use("Agg")
@@ -138,36 +138,22 @@ def actogram(profile_long: pd.DataFrame, output: Path, lights_on: int = LIGHTS_O
 def _hourly_value_per_animal(block: pd.DataFrame, measure: str) -> pd.DataFrame:
     """Reduce raw bins to one duration-weighted value per animal, per hour-of-day.
 
-    Pools bins across every calendar date at the same hour-of-day for one
-    animal, using the same per-measure rule `metrics._aggregate_measure` uses
-    (duration-weighted for rate/mean, the maximum for max, a rate per valid
-    hour for count), so the result does not carry a bin-width artefact the
-    way a flat per-bin mean would. Returns one row per (cage, tag, genotype,
-    hour) -- the animal is the unit this reduces to, so a caller can then
-    compute mean/SEM ACROSS ANIMALS rather than across pooled bins.
+    Delegates the reduction itself to `metrics.hourly_by_animal` (the same
+    per-measure rule `metrics._aggregate_measure` uses: duration-weighted for
+    rate/mean, the maximum for max, a rate per valid hour for count -- see
+    that function's docstring), so the result does not carry a bin-width
+    artefact the way a flat per-bin mean would, then joins genotype back in
+    (`block` must already carry it, one value per (cage, tag)). Returns one
+    row per (cage, tag, genotype, hour) -- the animal is the unit this
+    reduces to, so a caller can then compute mean/SEM ACROSS ANIMALS rather
+    than across pooled bins. `groups.hourly_profile_by_animal` reuses the
+    same `metrics.hourly_by_animal` call for the cluster-permutation test, so
+    the per-animal, per-hour value is computed in exactly one place.
     """
-    kind = MEASURE_KIND.get(measure)
-    frame = block.copy()
-    frame["weighted"] = frame["value"] * frame["duration_s"]
-    # As in `metrics._aggregate_measure`: the duration weight must count only
-    # bins whose value is present, or a partially-missing group's denominator
-    # includes minutes that contributed nothing to its numerator (deflating
-    # the result), and an all-missing group's `seconds` stays nonzero (so
-    # `.replace(0, np.nan)` never fires) and returns a hard, plausible 0.0
-    # instead of NaN.
-    frame["duration_present"] = frame["duration_s"].where(frame["value"].notna(), 0.0)
-    grouped = frame.groupby(["cage", "tag", "genotype", "hour"], as_index=False).agg(
-        weighted=("weighted", "sum"), seconds=("duration_present", "sum"),
-        total=("value", "sum"), peak=("value", "max"))
-    if kind in ("rate", "mean"):
-        grouped["value"] = grouped["weighted"] / grouped["seconds"].replace(0, np.nan)
-    elif kind == "max":
-        grouped["value"] = grouped["peak"]
-    elif kind == "count":
-        grouped["value"] = grouped["total"] / (grouped["seconds"] / 3600.0).replace(0, np.nan)
-    else:
-        raise ValueError(f"no aggregation rule for measure kind {kind!r}")
-    return grouped[["cage", "tag", "genotype", "hour", "value"]]
+    per_animal = metrics.hourly_by_animal(block, measure)
+    genotype = block[["cage", "tag", "genotype"]].drop_duplicates()
+    merged = per_animal.merge(genotype, on=["cage", "tag"], how="left")
+    return merged[["cage", "tag", "genotype", "hour", "value"]]
 
 
 def phase_profiles(hourly: pd.DataFrame, output: Path, measures: list[str],
