@@ -77,3 +77,62 @@ def test_skipped_scan_prints_the_real_reason_not_the_no_both_genotypes_text(
     text = build_study_report(study, tmp_path / "out").read_text().lower()
     assert "nonexistent_measure_all (absent)" in text
     assert "no loaded cage contains both genotypes" not in text
+
+
+def _single_cage_study(make_workbook, tmp_path, minutes):
+    """One all-wildtype cage (mirrors `all_wildtype_study`) with a chosen bin width
+    pattern, so the aggregation sentence's uniform vs. varying-duration branch can
+    be exercised without hardcoding either observed distribution into the test."""
+    import json
+
+    from neu_oldenlabs.config import load_study
+
+    def varying(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        return 1.0 + tag + (index % 7)
+
+    export = make_workbook(name="58616_x_cage.xlsx", tags=(1, 2, 3, 4, 5),
+                           bins=6 * 24 * 2, minutes=minutes, values=varying)
+    animals = tmp_path / "animals.csv"
+    rows = ["cage #,animal #,,genotype,tag #,Tag date,Monitoring start"]
+    for index, tag in enumerate((1, 2, 3, 4, 5), start=1):
+        prefix = "58616" if tag == 1 else ""
+        rows.append(f"{prefix},{index},L,W/w,{tag},,")
+    animals.write_text("\n".join(rows) + "\n")
+
+    config = tmp_path / "study.json"
+    config.write_text(json.dumps({
+        "name": "bin_timing_check", "animals_csv": str(animals),
+        "cages": [{"cage": 58616, "export": str(export)}],
+        "habituation_days": 0, "lights_on": 7, "lights_off": 19, "min_days": 1,
+        "primary_measures": ["distance_cm_all"], "scan_measures": ["distance_cm_all"],
+    }))
+    return load_study(config)
+
+
+def test_methods_aggregation_sentence_states_uniform_bin_duration_from_the_fixture(
+    make_workbook, tmp_path,
+):
+    """When every fixture bin has the same duration (the real cage-58616 shape),
+    the Methods sentence must say so, derived from `qc.bin_regularity` on this
+    run's own data -- not assert a jitter range this fixture does not have."""
+    study = _single_cage_study(make_workbook, tmp_path, minutes=(10,))
+    text = build_study_report(study, tmp_path / "out").read_text()
+    assert "spans exactly 10 minutes (600 s)" in text
+    assert "no bin-duration jitter in this export" in text.lower()
+    assert "not uniform" not in text.lower()
+
+
+def test_methods_aggregation_sentence_reports_the_range_when_bins_actually_vary(
+    make_workbook, tmp_path,
+):
+    """When the fixture's bins genuinely vary (9/10/11 minutes), the Methods
+    sentence must report that observed range instead of the uniform-duration
+    wording -- proving the sentence tracks THIS fixture's data, not a fixed
+    string reused from the uniform case."""
+    study = _single_cage_study(make_workbook, tmp_path, minutes=(10, 9, 11))
+    text = build_study_report(study, tmp_path / "out").read_text()
+    assert "bin duration is not uniform" in text.lower()
+    assert "ranges from 9 to 11 minutes" in text.lower()
+    assert "spans exactly" not in text.lower()

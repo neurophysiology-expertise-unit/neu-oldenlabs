@@ -1,9 +1,14 @@
 """Read one Oldenlabs cage export into a tidy long table.
 
 The export is wide: a two-row header where row 1 repeats the animal tag once per
-measure block and row 2 names the measure, then one row per time bin. Bins are
-nominally ten minutes and observed to vary between nine and eleven, so the bin
-duration is carried on every row and every downstream aggregation weights by it.
+measure block and row 2 names the measure, then one row per time bin. Each bin's
+own duration (`Datetime to` minus `Datetime from`) is carried on every row rather
+than assumed to be a fixed ten minutes -- in the real cage-58616 export every bin
+happens to span exactly 600 s, but a future export need not -- so every
+downstream aggregation weights by the bin's actual duration as a safeguard, not
+as a response to jitter observed here. That span is a different quantity from
+the gap between consecutive bins' start times, which the real export does vary
+by a minute here and there (see `qc.bin_regularity` and `qc.recording_breaks`).
 
 Measure names are mapped through an explicit dictionary. An unrecognised name
 raises: a vendor software update that renames a column must surface as a crash,

@@ -3,8 +3,13 @@
 Three aggregation rules, chosen by measure type, because using one rule for all
 of them is the easiest way to manufacture an effect:
 
-* rates and means are weighted by the actual bin duration -- the bins jitter
-  between nine and eleven minutes, so a flat mean silently overweights short bins;
+* rates and means are weighted by each bin's actual duration -- a bin's own span
+  (`Datetime to` minus `Datetime from`) need not be a fixed ten minutes, so a flat
+  mean would silently overweight a short bin if one ever appeared; in the real
+  cage-58616 export every bin happens to span exactly 600 s, so this weighting is
+  a no-op there and a safeguard for a future export, not a response to duration
+  jitter observed here (the START-TO-START gap between bins is a different
+  quantity and is the one that varies in that export; see `qc.bin_regularity`);
 * maxima take the maximum;
 * counts become a rate per valid hour, so a day that lost bins to the rack mask is
   not scored as a day of low activity.

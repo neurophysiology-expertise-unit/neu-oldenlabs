@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import groups
+from . import groups, qc
 from .config import StudyConfig
 from .io import MEASURE_KIND
 from .pipeline import _base_measure, run_study
@@ -135,6 +135,72 @@ def _count_kind_sentence(per_hour: list[str]) -> str:
     return base
 
 
+def _bin_timing_sentence(result: dict) -> str:
+    """Describe observed bin span and start-to-start cadence, read off the data.
+
+    A bin's own span (`Datetime to` minus `Datetime from`, via `qc.bin_regularity`)
+    and the gap between consecutive bin starts are two different quantities. The
+    real cage-58616 export has a constant 600 s span for every bin but an
+    irregular cadence (most gaps 10 minutes, some 11, a few 9), so this must be
+    generated from `result["long"]` rather than asserted, and the two quantities
+    must stay distinct in the sentence.
+    """
+    long = result["long"]
+    if long.empty:
+        return "No bins were loaded in this run, so bin span and cadence cannot be described."
+
+    regularity = qc.bin_regularity(long)
+    durations_min = sorted(set(regularity["duration_s"] / 60.0))
+    total_bins = int(regularity["bins"].sum())
+
+    if len(durations_min) == 1:
+        duration = durations_min[0]
+        span_line = (
+            f"Every one of the {total_bins} bins in this run spans exactly "
+            f"{duration:.4g} minutes ({int(round(duration * 60))} s) -- there is no "
+            f"bin-DURATION jitter in this export. Every rate or mean is still "
+            f"weighted by each bin's actual duration rather than a plain mean over "
+            f"bins, as a safeguard should a future export vary, not as a response "
+            f"to jitter observed here."
+        )
+    else:
+        span_line = (
+            f"Bin duration is NOT uniform in this run: across {total_bins} bins it "
+            f"ranges from {durations_min[0]:.4g} to {durations_min[-1]:.4g} minutes "
+            f"(`qc.bin_regularity`), so every rate or mean is weighted by each bin's "
+            f"actual duration rather than a plain mean over bins."
+        )
+
+    bins_sorted = (long.drop_duplicates(subset=["cage", "bin_start"])
+                   .sort_values(["cage", "bin_start"]))
+    gaps = (bins_sorted.groupby("cage")["bin_start"]
+            .apply(lambda s: s.diff().dt.total_seconds() / 60.0)
+            .dropna())
+    if gaps.empty:
+        return span_line
+
+    gap_counts = gaps.round(6).value_counts().sort_index()
+    total_gaps = int(gap_counts.sum())
+    if len(gap_counts) == 1:
+        cadence_line = (
+            f"Start-to-start CADENCE between consecutive bins is likewise uniform, "
+            f"at {gap_counts.index[0]:.4g} minutes across all {total_gaps} gaps.")
+    else:
+        modal_gap = gap_counts.idxmax()
+        off_parts = []
+        for value, count in gap_counts.items():
+            if value == modal_gap:
+                continue
+            delta = value - modal_gap
+            kind = "coverage hole" if delta > 0 else "overlap"
+            off_parts.append(f"{int(count)} at {value:.4g} min ({abs(delta):.4g}-min {kind})")
+        cadence_line = (
+            f"Start-to-start CADENCE between consecutive bins is a distinct quantity "
+            f"from bin duration and is NOT perfectly uniform here: {int(gap_counts[modal_gap])} "
+            f"of {total_gaps} gaps are {modal_gap:.4g} minutes; " + "; ".join(off_parts) + ".")
+    return span_line + " " + cadence_line
+
+
 def _methods(study: StudyConfig, result: dict) -> str:
     scan = result["scan"]
     all_measures = list(dict.fromkeys(list(study.primary_measures) + list(study.scan_measures)))
@@ -158,12 +224,10 @@ def _methods(study: StudyConfig, result: dict) -> str:
     lines = [
         "## Methods",
         "",
-        "**Aggregation.** Each bin is nominally 10 minutes but jitters between 9 and "
-        "11; every rate or mean is weighted by the bin's actual duration, never a "
-        "plain mean over bins. Maxima take the maximum. Counts (see below) become a "
-        "rate per valid hour, so a day that lost bins to the rack mask is not scored "
-        "as a day of low activity. Bins where `Cage in rack == 0` are excluded from "
-        "every metric before aggregation.",
+        f"**Aggregation.** {_bin_timing_sentence(result)} Maxima take the maximum. "
+        "Counts (see below) become a rate per valid hour, so a day that lost bins to "
+        "the rack mask is not scored as a day of low activity. Bins where "
+        "`Cage in rack == 0` are excluded from every metric before aggregation.",
         "",
         per_hour_line,
         "",
