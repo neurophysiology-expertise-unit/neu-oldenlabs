@@ -88,9 +88,17 @@ def actogram(profile_long: pd.DataFrame, output: Path, lights_on: int = LIGHTS_O
     if not distance.empty:
         distance["date"] = distance["bin_start"].dt.date.astype(str)
         distance["hour"] = distance["bin_start"].dt.hour
+        # A cell's duration weight must count only bins whose value is actually
+        # present (`metrics._aggregate_measure`'s rule) -- otherwise a cell that
+        # is entirely NaN (e.g. a literal 'NaN' string in the export) sums to
+        # total=0.0 (pandas sums an all-NaN group to 0.0) over a NONZERO
+        # seconds (every bin's full duration, present or not), landing on a
+        # hard, plausible 0.0 instead of the honest NaN.
+        distance["duration_present"] = distance["duration_s"].where(
+            distance["value"].notna(), 0.0)
         grouped = distance.groupby(["cage", "tag", "date", "hour"], as_index=False).agg(
-            total=("value", "sum"), seconds=("duration_s", "sum"))
-        grouped["value"] = grouped["total"] / (grouped["seconds"] / 3600.0)
+            total=("value", "sum"), seconds=("duration_present", "sum"))
+        grouped["value"] = grouped["total"] / (grouped["seconds"] / 3600.0).replace(0, np.nan)
         table = grouped[["cage", "tag", "date", "hour", "value"]]
 
     animals = sorted(set(zip(table["cage"], table["tag"])))
@@ -141,8 +149,15 @@ def _hourly_value_per_animal(block: pd.DataFrame, measure: str) -> pd.DataFrame:
     kind = MEASURE_KIND.get(measure)
     frame = block.copy()
     frame["weighted"] = frame["value"] * frame["duration_s"]
+    # As in `metrics._aggregate_measure`: the duration weight must count only
+    # bins whose value is present, or a partially-missing group's denominator
+    # includes minutes that contributed nothing to its numerator (deflating
+    # the result), and an all-missing group's `seconds` stays nonzero (so
+    # `.replace(0, np.nan)` never fires) and returns a hard, plausible 0.0
+    # instead of NaN.
+    frame["duration_present"] = frame["duration_s"].where(frame["value"].notna(), 0.0)
     grouped = frame.groupby(["cage", "tag", "genotype", "hour"], as_index=False).agg(
-        weighted=("weighted", "sum"), seconds=("duration_s", "sum"),
+        weighted=("weighted", "sum"), seconds=("duration_present", "sum"),
         total=("value", "sum"), peak=("value", "max"))
     if kind in ("rate", "mean"):
         grouped["value"] = grouped["weighted"] / grouped["seconds"].replace(0, np.nan)
@@ -270,17 +285,20 @@ def cage_paired(profile: pd.DataFrame, output: Path, measures: list[str]) -> Non
 
 
 def effect_forest(scan: pd.DataFrame, output: Path) -> None:
-    """Forest plot of Hedges' g and its CI (in g units), ranked by p-value.
+    """Forest plot of Hedges' g and its own bootstrap CI, ranked by p-value.
 
     Plotting the raw `difference` mixes centimetres, percentages, and
     unitless indices on one shared axis -- with a real scan, distance sets
     the scale and every percentage/index collapses onto the zero line.
     Hedges' g is unitless and already computed (`groups.hedges_g`), so it is
-    what goes on the shared axis instead. The bootstrap CI (`ci_low`/`ci_high`)
-    is on the same scale as `difference`, not `hedges_g`, so it is rescaled by
-    `hedges_g / difference` -- the same ratio that converts the point estimate
-    itself from raw units to SD units -- to keep the interval's width, in SD
-    units, consistent with the point.
+    what goes on the shared axis instead. `g_ci_low`/`g_ci_high`
+    (`groups.cluster_bootstrap_g_ci`, via `groups._cluster_bootstrap`) are
+    g's OWN percentile bootstrap CI -- every draw recomputes g from its own
+    resampled pooled SD, not the raw-difference CI rescaled by the point
+    estimate's fixed `hedges_g / difference` ratio, which would silently
+    treat the pooled SD as constant across draws when it in fact resamples
+    with everything else, and would collapse to zero width whenever
+    `difference` is exactly 0.
 
     Writes nothing when there is no per-measure comparison to plot: either the
     scan table carries only a `note` explaining a skip (no `measure` column),
@@ -291,11 +309,7 @@ def effect_forest(scan: pd.DataFrame, output: Path) -> None:
         return
 
     table = scan[["measure", "difference", "ci_low", "ci_high", "hedges_g",
-                 "p_value", "p_adjusted_bh"]].copy()
-    scale = np.where(table["difference"] != 0,
-                     table["hedges_g"] / table["difference"].replace(0, np.nan), 0.0)
-    table["g_ci_low"] = table["ci_low"] * scale
-    table["g_ci_high"] = table["ci_high"] * scale
+                 "g_ci_low", "g_ci_high", "p_value", "p_adjusted_bh"]].copy()
     ordered = table.sort_values("p_value").reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(6, 0.5 * len(ordered) + 1.5))
@@ -304,6 +318,13 @@ def effect_forest(scan: pd.DataFrame, output: Path) -> None:
         color = "#d03b3b" if row.p_adjusted_bh < 0.05 else "#52514e"
         if pd.isna(row.hedges_g):
             ax.scatter([0], [y_position], marker="x", color="#999999", s=30, zorder=2)
+            continue
+        if pd.isna(row.g_ci_low) or pd.isna(row.g_ci_high):
+            # g itself is defined but no bootstrap draw had a poolable cage
+            # (vanishingly rare, but possible) -- plot the point with no
+            # interval rather than feeding NaN bounds into errorbar.
+            ax.scatter([row.hedges_g], [y_position], marker="o", color=color,
+                      s=25, zorder=2)
             continue
         ax.errorbar([row.hedges_g], [y_position],
                    xerr=[[row.hedges_g - row.g_ci_low], [row.g_ci_high - row.hedges_g]],

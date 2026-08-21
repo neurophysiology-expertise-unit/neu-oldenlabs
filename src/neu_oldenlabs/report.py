@@ -222,6 +222,16 @@ def _bin_timing_sentence(result: dict) -> str:
     irregular cadence (most gaps 10 minutes, some 11, a few 9), so this must be
     generated from `result["long"]` rather than asserted, and the two quantities
     must stay distinct in the sentence.
+
+    Cadence is judged PER CAGE, against that cage's own modal gap -- the real
+    study mixes a 10-minute-cadence cage (58616) with five 60-minute-cadence
+    cages, and pooling every cage's gaps into one modal value before judging
+    deviations would score an hourly cage's own normal, gapless 60-minute
+    cadence as a "coverage hole" relative to a different cage's 10-minute
+    mode (the same spacing-vs-duration conflation `643ab77` removed from the
+    Methods text, resurfacing here across cages instead of within one).
+    `qc.recording_breaks` already uses this per-cage-relative pattern for the
+    same reason.
     """
     long = result["long"]
     if long.empty:
@@ -251,31 +261,41 @@ def _bin_timing_sentence(result: dict) -> str:
 
     bins_sorted = (long.drop_duplicates(subset=["cage", "bin_start"])
                    .sort_values(["cage", "bin_start"]))
-    gaps = (bins_sorted.groupby("cage")["bin_start"]
-            .apply(lambda s: s.diff().dt.total_seconds() / 60.0)
-            .dropna())
-    if gaps.empty:
+
+    cage_lines = []
+    for cage, cage_bins in bins_sorted.groupby("cage", sort=True):
+        gaps = cage_bins["bin_start"].diff().dt.total_seconds() / 60.0
+        gaps = gaps.dropna()
+        if gaps.empty:
+            continue
+        gap_counts = gaps.round(6).value_counts().sort_index()
+        total_gaps = int(gap_counts.sum())
+        if len(gap_counts) == 1:
+            cage_lines.append(
+                f"cage {cage}: uniform at {gap_counts.index[0]:.4g} minutes across "
+                f"all {total_gaps} gaps")
+        else:
+            modal_gap = gap_counts.idxmax()
+            off_parts = []
+            for value, count in gap_counts.items():
+                if value == modal_gap:
+                    continue
+                delta = value - modal_gap
+                kind = "coverage hole" if delta > 0 else "overlap"
+                off_parts.append(
+                    f"{int(count)} at {value:.4g} min ({abs(delta):.4g}-min {kind})")
+            cage_lines.append(
+                f"cage {cage}: {int(gap_counts[modal_gap])} of {total_gaps} gaps are "
+                f"{modal_gap:.4g} minutes (its own modal cadence); " + "; ".join(off_parts))
+    if not cage_lines:
         return span_line
 
-    gap_counts = gaps.round(6).value_counts().sort_index()
-    total_gaps = int(gap_counts.sum())
-    if len(gap_counts) == 1:
-        cadence_line = (
-            f"Start-to-start CADENCE between consecutive bins is likewise uniform, "
-            f"at {gap_counts.index[0]:.4g} minutes across all {total_gaps} gaps.")
-    else:
-        modal_gap = gap_counts.idxmax()
-        off_parts = []
-        for value, count in gap_counts.items():
-            if value == modal_gap:
-                continue
-            delta = value - modal_gap
-            kind = "coverage hole" if delta > 0 else "overlap"
-            off_parts.append(f"{int(count)} at {value:.4g} min ({abs(delta):.4g}-min {kind})")
-        cadence_line = (
-            f"Start-to-start CADENCE between consecutive bins is a distinct quantity "
-            f"from bin duration and is NOT perfectly uniform here: {int(gap_counts[modal_gap])} "
-            f"of {total_gaps} gaps are {modal_gap:.4g} minutes; " + "; ".join(off_parts) + ".")
+    cadence_line = (
+        "Start-to-start CADENCE between consecutive bins is a distinct quantity from "
+        "bin duration, and each cage is judged against its OWN modal gap -- this study "
+        "mixes cages of different bin widths, so pooling every cage's gaps into one "
+        "modal value before judging deviations would misscore one cage's normal cadence "
+        "as a gap relative to another's: " + "; ".join(cage_lines) + ".")
     return span_line + " " + cadence_line
 
 
@@ -383,7 +403,8 @@ def _methods(study: StudyConfig, result: dict) -> str:
 _COMPARE_DISPLAY_COLUMNS = [
     "measure", "n_mut", "n_wt", "n_mut_contributing", "n_wt_contributing",
     "cages_contributing", "difference", "ci_low", "ci_high",
-    "hedges_g", "p_value", "min_attainable_p", "assignments", "p_adjusted_bh",
+    "hedges_g", "g_ci_low", "g_ci_high",
+    "p_value", "min_attainable_p", "assignments", "p_adjusted_bh",
     "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
 ]
 

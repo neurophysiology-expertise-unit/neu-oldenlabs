@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from neu_oldenlabs.io import load_cage
-from neu_oldenlabs.plots import actogram, phase_profiles
+from neu_oldenlabs.plots import actogram, effect_forest, phase_profiles
 
 
 def _cage_with_bin_width(make_workbook, name, cage, minutes, bins, per_bin_value, start):
@@ -98,3 +99,124 @@ def test_phase_profiles_sem_is_taken_across_animals_not_pooled_bins(make_workboo
     assert round(float(row["mean"]), 6) == 50.0
     assert round(float(row["sem"]), 6) == 10.0
     assert int(row["n"]) == 2
+
+
+def test_actogram_all_missing_cell_is_nan_not_zero(tmp_path):
+    # An hour cell whose only bins are NaN (e.g. a literal 'NaN' string in the
+    # export, coerced by io.load_cage) must show NaN in the actogram cell.
+    # `pandas.Series.sum()` sums an all-NaN group to 0.0, and the old code's
+    # duration weight (`duration_s.sum()` over EVERY bin, not just present
+    # ones) stayed nonzero, so `total / (seconds / 3600.0)` landed on a hard,
+    # plausible 0.0 -- indistinguishable in the figure from a real zero-
+    # distance hour -- instead of the honest NaN.
+    start = datetime(2026, 7, 11, 20, 0)
+    table = pd.DataFrame({
+        "cage": [1001, 1001],
+        "tag": [1, 1],
+        "measure": ["distance_cm", "distance_cm"],
+        "bin_start": [start, start + pd.Timedelta(minutes=10)],
+        "duration_s": [600.0, 600.0],
+        "value": [np.nan, np.nan],
+    })
+    output = tmp_path / "figs"
+    actogram(table, output)
+    written = pd.read_csv(output / "actogram.csv")
+    row = written[(written["cage"] == 1001) & (written["hour"] == 20)].iloc[0]
+    assert np.isnan(row["value"])
+
+
+def test_actogram_partial_missing_cell_is_not_deflated(tmp_path):
+    # One present bin (60.0 cm over 540 s) and one missing bin (660 s) in the
+    # SAME hour cell. The honest duration-weighted-per-valid-hour value
+    # counts only the present bin's duration: 60.0 / (540 / 3600) = 400.0.
+    # The old code's denominator included the missing bin's duration too
+    # (540 + 660 = 1200 s), deflating the result to 60.0 / (1200 / 3600) =
+    # 180.0 -- a real, plausible-looking number, not an error.
+    start = datetime(2026, 7, 11, 20, 0)
+    table = pd.DataFrame({
+        "cage": [1001, 1001],
+        "tag": [1, 1],
+        "measure": ["distance_cm", "distance_cm"],
+        "bin_start": [start, start + pd.Timedelta(minutes=9)],
+        "duration_s": [540.0, 660.0],
+        "value": [60.0, np.nan],
+    })
+    output = tmp_path / "figs"
+    actogram(table, output)
+    written = pd.read_csv(output / "actogram.csv")
+    row = written[(written["cage"] == 1001) & (written["hour"] == 20)].iloc[0]
+    assert round(float(row["value"]), 6) == 400.0
+
+
+def test_phase_profiles_all_missing_animal_is_excluded_not_scored_as_zero(tmp_path):
+    # Two wt animals at the same hour: tag 1 has a real value (60.0 cm over a
+    # 600 s bin, i.e. 360.0 cm/valid-hour), tag 2 is entirely NaN that hour.
+    # `_hourly_value_per_animal`'s per-animal value for tag 2 must be NaN and
+    # get dropped from the mean (mean=360.0, n=1) -- not the old code's hard
+    # 0.0 (its `seconds` denominator stayed nonzero even with zero present
+    # duration), which would wrongly pull the animal into the average as a
+    # real zero-activity observation (mean=180.0, n=2).
+    start = datetime(2026, 7, 11, 20, 0)
+    hourly = pd.DataFrame({
+        "cage": [1001, 1001],
+        "tag": [1, 2],
+        "genotype": ["wt", "wt"],
+        "measure": ["distance_cm", "distance_cm"],
+        "bin_start": [start, start],
+        "duration_s": [600.0, 600.0],
+        "value": [60.0, np.nan],
+    })
+    output = tmp_path / "figs"
+    phase_profiles(hourly, output, ["distance_cm"])
+    table = pd.read_csv(output / "phase_profiles.csv")
+    row = table[(table["measure"] == "distance_cm") & (table["hour"] == 20)].iloc[0]
+    assert round(float(row["mean"]), 6) == 360.0
+    assert int(row["n"]) == 1
+
+
+def test_phase_profiles_partial_missing_bin_is_not_deflated(tmp_path):
+    # One animal, one hour, two bins: a present one (60.0 cm over 540 s) and
+    # a missing one (660 s). The honest per-valid-hour value counts only the
+    # present bin's duration: 60.0 / (540 / 3600) = 400.0. The old code's
+    # denominator included the missing bin's duration too (1200 s total),
+    # deflating the result to 60.0 / (1200 / 3600) = 180.0.
+    start = datetime(2026, 7, 11, 20, 0)
+    hourly = pd.DataFrame({
+        "cage": [1001, 1001],
+        "tag": [1, 1],
+        "genotype": ["wt", "wt"],
+        "measure": ["distance_cm", "distance_cm"],
+        "bin_start": [start, start + pd.Timedelta(minutes=9)],
+        "duration_s": [540.0, 660.0],
+        "value": [60.0, np.nan],
+    })
+    output = tmp_path / "figs"
+    phase_profiles(hourly, output, ["distance_cm"])
+    table = pd.read_csv(output / "phase_profiles.csv")
+    row = table[(table["measure"] == "distance_cm") & (table["hour"] == 20)].iloc[0]
+    assert round(float(row["mean"]), 6) == 400.0
+
+
+def test_effect_forest_passes_through_gs_own_bootstrap_ci_even_when_difference_is_zero(
+    tmp_path,
+):
+    # `g_ci_low`/`g_ci_high` are now computed upstream by
+    # `groups.cluster_bootstrap_g_ci` (bootstrapping g directly) and simply
+    # passed through here -- effect_forest must no longer derive them by
+    # rescaling `ci_low`/`ci_high` by `hedges_g / difference`, which would
+    # divide by zero and collapse the interval to zero width whenever
+    # `difference` is exactly 0.0. A measure with difference == 0.0 but a
+    # real, nonzero-width g interval (as `groups.compare` can legitimately
+    # produce, since g's bootstrap is independent of the raw-difference
+    # bootstrap) must keep that nonzero interval intact.
+    scan = pd.DataFrame([{
+        "measure": "distance_cm_all", "difference": 0.0, "ci_low": -1.0, "ci_high": 1.0,
+        "hedges_g": 0.0, "g_ci_low": -0.4, "g_ci_high": 0.6,
+        "p_value": 0.5, "p_adjusted_bh": 0.5,
+    }])
+    output = tmp_path / "figs"
+    effect_forest(scan, output)
+    table = pd.read_csv(output / "effect_forest.csv")
+    row = table.iloc[0]
+    assert round(float(row["g_ci_low"]), 6) == -0.4
+    assert round(float(row["g_ci_high"]), 6) == 0.6

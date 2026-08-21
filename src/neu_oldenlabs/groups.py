@@ -164,12 +164,26 @@ def hedges_g(values: pd.DataFrame) -> float:
     return float(d * correction)
 
 
-def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
-                         level: float = 0.95) -> tuple[float, float]:
+def _cluster_bootstrap(values: pd.DataFrame, draws: int = 5000,
+                       level: float = 0.95) -> dict[str, tuple[float, float]]:
     """Resample cages, then animals within genotype within cage.
 
     Resampling cages is what makes this interval honest: the cage, not the animal,
     is the unit that repeats if the study were run again.
+
+    Computes the bootstrap distribution of BOTH `stratified_difference` and
+    `hedges_g` from the SAME draws (one resampling pass, not two): every draw
+    recomputes `hedges_g`'s own pooled SD from that draw's resampled mut/wt
+    arrays (contributing cages only, pooling within-genotype variance across
+    cages with >=2 animals per genotype -- which cages qualify is fixed by the
+    original animal counts, since a bootstrap draw resamples each cage back to
+    its own original size; only which cages appear, and how many times, varies
+    draw to draw) and the correction on that draw's own pooled animal count --
+    rather than rescaling the difference-CI by the point estimate's fixed
+    g/difference ratio, which would silently treat the pooled SD as constant
+    across draws when it is not. A draw where no cage qualifies for pooling
+    (so g is undefined that draw) is dropped from the g quantiles rather than
+    contaminating them with a placeholder value.
 
     5000 draws is not cheap: `compare` (bootstrap + exact permutation + mixed
     model) measured at ~4.7 s per measure, so a thirty-measure `scan` costs on
@@ -183,20 +197,61 @@ def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
     blocks = {cage: {genotype: block["value"].to_numpy(dtype=float)
                      for genotype, block in frame[frame["cage"] == cage].groupby("genotype")}
               for cage in cages}
+    # Whether a cage qualifies for the pooled-variance sum is fixed by its own
+    # original animal counts (a bootstrap draw resamples it back to that same
+    # size), so this is computed once rather than inside the draw loop.
+    poolable = {cage for cage in cages
+               if len(blocks[cage]["mut"]) >= 2 and len(blocks[cage]["wt"]) >= 2}
+
     rng = np.random.default_rng(RNG_SEED)
-    estimates = np.empty(draws)
+    differences = np.empty(draws)
+    g_estimates = np.full(draws, np.nan)
     for draw in range(draws):
         picked = rng.choice(cages, len(cages), replace=True)
         numerator = denominator = 0.0
+        pooled_ss = 0.0
+        pooled_df = 0
+        n_total = 0
         for cage in picked:
             weight = weights[cage]
             mut = rng.choice(blocks[cage]["mut"], len(blocks[cage]["mut"]), replace=True)
             wt = rng.choice(blocks[cage]["wt"], len(blocks[cage]["wt"]), replace=True)
             numerator += weight * (mut.mean() - wt.mean())
             denominator += weight
-        estimates[draw] = numerator / denominator
+            if cage in poolable:
+                pooled_ss += (len(mut) - 1) * mut.var(ddof=1) + (len(wt) - 1) * wt.var(ddof=1)
+                pooled_df += (len(mut) - 1) + (len(wt) - 1)
+                n_total += len(mut) + len(wt)
+        difference = numerator / denominator
+        differences[draw] = difference
+        if pooled_df > 0:
+            pooled_sd = np.sqrt(pooled_ss / pooled_df)
+            if pooled_sd > 0:
+                correction = 1 - 3 / (4 * n_total - 9)
+                g_estimates[draw] = (difference / pooled_sd) * correction
+
     tail = (1 - level) / 2
-    return float(np.quantile(estimates, tail)), float(np.quantile(estimates, 1 - tail))
+    result = {"difference": (float(np.quantile(differences, tail)),
+                             float(np.quantile(differences, 1 - tail)))}
+    finite_g = g_estimates[np.isfinite(g_estimates)]
+    if finite_g.size == 0:
+        result["hedges_g"] = (float("nan"), float("nan"))
+    else:
+        result["hedges_g"] = (float(np.quantile(finite_g, tail)),
+                              float(np.quantile(finite_g, 1 - tail)))
+    return result
+
+
+def cluster_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
+                         level: float = 0.95) -> tuple[float, float]:
+    """Percentile bootstrap CI for the stratified difference. See `_cluster_bootstrap`."""
+    return _cluster_bootstrap(values, draws, level)["difference"]
+
+
+def cluster_bootstrap_g_ci(values: pd.DataFrame, draws: int = 5000,
+                           level: float = 0.95) -> tuple[float, float]:
+    """Percentile bootstrap CI for Hedges' g itself. See `_cluster_bootstrap`."""
+    return _cluster_bootstrap(values, draws, level)["hedges_g"]
 
 
 def mixed_model(values: pd.DataFrame) -> dict:
@@ -257,7 +312,12 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
     if contributing == 0:
         raise ValueError(f"{measure}: no cage contains both genotypes; nothing to compare")
     p, assignments, floor = exact_stratified_permutation(values)
-    low, high = cluster_bootstrap_ci(values)
+    # One resampling pass produces both CIs (see `_cluster_bootstrap`): calling
+    # `cluster_bootstrap_ci` and `cluster_bootstrap_g_ci` separately here would
+    # silently double the ~5000-draw bootstrap cost per measure.
+    bootstrap = _cluster_bootstrap(values)
+    low, high = bootstrap["difference"]
+    g_low, g_high = bootstrap["hedges_g"]
     model = mixed_model(values)
 
     # `n_mut`/`n_wt` count every animal with a non-NaN value, INCLUDING
@@ -283,6 +343,7 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
         "difference": stratified_difference(values),
         "ci_low": low, "ci_high": high,
         "hedges_g": hedges_g(values),
+        "g_ci_low": g_low, "g_ci_high": g_high,
         "p_value": p, "assignments": assignments, "min_attainable_p": floor,
         "lmm_coefficient": model["coefficient"], "lmm_se": model["se"],
         "lmm_p_value": model["p_value"], "lmm_converged": model["converged"],
@@ -303,7 +364,8 @@ def compare(profile: pd.DataFrame, measure: str) -> dict:
 _COMPARE_COLUMNS = [
     "measure", "n_mut", "n_wt", "n_mut_contributing", "n_wt_contributing",
     "cages_contributing", "mean_mut", "mean_wt", "difference",
-    "ci_low", "ci_high", "hedges_g", "p_value", "assignments", "min_attainable_p",
+    "ci_low", "ci_high", "hedges_g", "g_ci_low", "g_ci_high",
+    "p_value", "assignments", "min_attainable_p",
     "lmm_coefficient", "lmm_se", "lmm_p_value", "lmm_converged", "lmm_note",
 ]
 

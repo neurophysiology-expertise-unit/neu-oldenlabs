@@ -146,6 +146,50 @@ def test_hourly_activity_raises_when_distance_measure_is_absent():
         hourly_activity(long)
 
 
+def test_hourly_activity_all_missing_hour_is_nan_not_zero():
+    # An hour whose only bins are NaN (e.g. cage 58627 tag 4, missing in 1075
+    # of 1076 hours in the real export) must be NaN, not the hard, plausible
+    # 0.0 that a duration weight summed over EVERY bin (present or not)
+    # would produce -- `_as_hourly`/the IS-IV-RA family need that NaN to
+    # treat the hour as a genuine gap, not a real zero-activity observation
+    # that would otherwise fabricate a rhythm.
+    bin_starts = pd.to_datetime(["2026-07-12 00:00", "2026-07-12 00:10"])
+    long = pd.DataFrame({
+        "cage": [1, 1],
+        "tag": ["A", "A"],
+        "bin_start": bin_starts,
+        "bin_end": bin_starts + pd.Timedelta(minutes=10),
+        "duration_s": [600, 600],
+        "measure": ["distance_cm", "distance_cm"],
+        "value": [np.nan, np.nan],
+    })
+    result = hourly_activity(long)
+    assert len(result) == 1
+    assert np.isnan(result["distance_per_hour"].iloc[0])
+
+
+def test_hourly_activity_partial_missing_bin_is_not_deflated():
+    # One present bin (60.0 cm over 540 s) and one missing bin (660 s) in the
+    # same hour. The honest rate counts only the present bin's duration:
+    # 60.0 / (540 / 3600) = 400.0. The old code's denominator included the
+    # missing bin's duration too (1200 s total), deflating the rate to
+    # 60.0 / (1200 / 3600) = 180.0.
+    bin_starts = pd.to_datetime(["2026-07-12 00:00", "2026-07-12 00:09"])
+    long = pd.DataFrame({
+        "cage": [1, 1],
+        "tag": ["A", "A"],
+        "bin_start": bin_starts,
+        "bin_end": [bin_starts[0] + pd.Timedelta(minutes=9),
+                   bin_starts[1] + pd.Timedelta(minutes=11)],
+        "duration_s": [540, 660],
+        "measure": ["distance_cm", "distance_cm"],
+        "value": [60.0, np.nan],
+    })
+    result = hourly_activity(long)
+    assert len(result) == 1
+    assert round(result["distance_per_hour"].iloc[0], 6) == 400.0
+
+
 def _long_frame_for_profile(cage, tag, days=3):
     index = pd.date_range("2026-07-12", periods=24 * days, freq="h")
     radians = 2 * np.pi * (index.hour - 3.0) / 24

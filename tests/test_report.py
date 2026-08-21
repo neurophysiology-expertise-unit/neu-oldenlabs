@@ -136,3 +136,55 @@ def test_methods_aggregation_sentence_reports_the_range_when_bins_actually_vary(
     assert "bin duration is not uniform" in text.lower()
     assert "ranges from 9 to 11 minutes" in text.lower()
     assert "spans exactly" not in text.lower()
+
+
+def _two_cage_bin_width_study(make_workbook, tmp_path):
+    """One 10-minute-cadence cage (mirrors 58616) and one 60-minute-cadence
+    cage (mirrors the study's other five), each internally uniform but
+    different from each other -- exactly the shape that makes cadence
+    conflation across cages observable."""
+    import json
+
+    from neu_oldenlabs.config import load_study
+
+    def varying(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        return 1.0 + tag + (index % 7)
+
+    fine = make_workbook(name="58616_x_cage.xlsx", tags=(1,), bins=6 * 24,
+                         minutes=(10,), values=varying)
+    coarse = make_workbook(name="1002_x_cage.xlsx", tags=(1,), bins=24,
+                           minutes=(60,), values=varying)
+    animals = tmp_path / "animals.csv"
+    animals.write_text(
+        "cage #,animal #,,genotype,tag #,Tag date,Monitoring start\n"
+        "58616,1,L,W/w,1,,\n"
+        "1002,2,L,W/w,1,,\n"
+    )
+    config = tmp_path / "study.json"
+    config.write_text(json.dumps({
+        "name": "bin_timing_two_cage", "animals_csv": str(animals),
+        "cages": [{"cage": 58616, "export": str(fine)},
+                  {"cage": 1002, "export": str(coarse)}],
+        "habituation_days": 0, "lights_on": 7, "lights_off": 19, "min_days": 1,
+        "primary_measures": ["distance_cm_all"], "scan_measures": ["distance_cm_all"],
+    }))
+    return load_study(config)
+
+
+def test_methods_bin_timing_judges_each_cages_cadence_against_its_own_bin_width(
+    make_workbook, tmp_path,
+):
+    """A study mixing a 10-minute-cadence cage with a 60-minute-cadence one must
+    not pool their gaps into one global modal cadence -- doing so scores the
+    60-minute cage's own normal, gapless cadence as a large "coverage hole"
+    relative to the 10-minute cage's mode, which is false: cage 1002's cadence
+    is perfectly uniform on its own terms. The sentence must say so per cage."""
+    study = _two_cage_bin_width_study(make_workbook, tmp_path)
+    text = build_study_report(study, tmp_path / "out").read_text().lower()
+    # Cage 1002's own cadence must be reported as uniform, not as a coverage
+    # hole scored against cage 58616's 10-minute mode.
+    assert "cage 1002: uniform at 60 minutes" in text
+    assert "50-min coverage hole" not in text
+    assert "cage 58616: uniform at 10 minutes" in text

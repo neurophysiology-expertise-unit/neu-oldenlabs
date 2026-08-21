@@ -16,14 +16,24 @@ import pandas as pd
 
 
 def hourly_activity(long: pd.DataFrame) -> pd.DataFrame:
-    """Distance per hour, on a regular hourly grid, per animal."""
+    """Distance per hour, on a regular hourly grid, per animal.
+
+    The duration weight in the denominator must count only bins whose value
+    is actually present (`metrics._aggregate_measure`'s rule), or an
+    all-missing hour sums to a hard, plausible `0.0` (pandas sums an all-NaN
+    group to 0.0) instead of NaN -- and `_as_hourly` needs that NaN to treat
+    the hour as a genuine gap in the recording rather than a real zero-
+    activity observation feeding the cosinor and IS/IV/RA fits.
+    """
     distance = long[long["measure"] == "distance_cm"].copy()
     if distance.empty:
         raise ValueError("no distance_cm measure; cannot build an activity signal")
     distance["hour_start"] = distance["bin_start"].dt.floor("h")
+    distance["duration_present"] = distance["duration_s"].where(distance["value"].notna(), 0.0)
     grouped = distance.groupby(["cage", "tag", "hour_start"], as_index=False).agg(
-        distance=("value", "sum"), seconds=("duration_s", "sum"))
-    grouped["distance_per_hour"] = grouped["distance"] / (grouped["seconds"] / 3600.0)
+        distance=("value", "sum"), seconds=("duration_present", "sum"))
+    grouped["distance_per_hour"] = (
+        grouped["distance"] / (grouped["seconds"] / 3600.0).replace(0, np.nan))
     return grouped[["cage", "tag", "hour_start", "distance_per_hour"]]
 
 

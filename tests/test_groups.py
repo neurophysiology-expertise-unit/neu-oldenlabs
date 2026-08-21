@@ -10,9 +10,9 @@ from statsmodels.regression.mixed_linear_model import MixedLM
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from neu_oldenlabs.groups import (_COMPARE_COLUMNS, benjamini_hochberg, cage_weights,
-                                  cluster_bootstrap_ci, compare, count_assignments,
-                                  exact_stratified_permutation, hedges_g, mixed_model, scan,
-                                  stratified_difference)
+                                  cluster_bootstrap_ci, cluster_bootstrap_g_ci, compare,
+                                  count_assignments, exact_stratified_permutation, hedges_g,
+                                  mixed_model, scan, stratified_difference)
 
 # The real study composition: 58616 is 5 wt / 0 mut, 58623 and 66336 are 2 wt / 3 mut,
 # 58627 is 3 wt / 1 mut, 62923 is 1 wt / 1 mut, 58597 is 2 wt / 2 mut.
@@ -148,6 +148,36 @@ def test_bootstrap_interval_is_reproducible_and_brackets_the_observed_statistic(
     assert first[0] > 0.0
 
 
+def test_bootstrap_g_ci_is_reproducible_and_brackets_the_observed_g():
+    # Same guarantees as the difference CI above, but for a CI computed for
+    # Hedges' g ITSELF -- every draw recomputes g from its own resampled
+    # pooled SD (see `groups._cluster_bootstrap`), not the difference CI
+    # rescaled by a fixed point-estimate ratio.
+    values = study_values(effect=4.0, seed=1)
+    first = cluster_bootstrap_g_ci(values, draws=2000)
+    second = cluster_bootstrap_g_ci(values, draws=2000)
+    assert first == second
+    assert first[0] < first[1]
+    observed = hedges_g(values)
+    assert first[0] < observed < first[1]
+
+
+def test_bootstrap_g_ci_is_not_a_fixed_rescale_of_the_difference_ci():
+    # The rejected approach multiplied the difference CI's bounds by the
+    # point estimate's fixed `hedges_g / difference` ratio, which is exactly
+    # equivalent to scaling the difference CI's WIDTH by that same ratio.
+    # Bootstrapping g directly -- letting the pooled SD resample along with
+    # the mean difference on every draw -- has no reason to reproduce that
+    # exact width, so the two must differ.
+    values = study_values(effect=4.0, seed=1)
+    diff_low, diff_high = cluster_bootstrap_ci(values, draws=2000)
+    g_low, g_high = cluster_bootstrap_g_ci(values, draws=2000)
+    observed_difference = stratified_difference(values)
+    observed_g = hedges_g(values)
+    rescaled_width = (diff_high - diff_low) * (observed_g / observed_difference)
+    assert (g_high - g_low) != pytest.approx(rescaled_width, rel=1e-9)
+
+
 def test_benjamini_hochberg_matches_a_hand_computed_example():
     # [0.01, 0.02, 0.03, 0.04] is a degenerate example: every step-up value
     # p_i * n / i comes out to exactly 0.04 for every i, so the cumulative-
@@ -174,6 +204,7 @@ def test_compare_returns_a_row_with_counts_effect_and_interval():
     assert row["n_mut_contributing"] == 10 and row["n_wt_contributing"] == 10
     assert row["cages_contributing"] == 5
     assert row["ci_low"] < row["difference"] < row["ci_high"]
+    assert row["g_ci_low"] < row["hedges_g"] < row["g_ci_high"]
     # 1/4800, not 2/4800 -- the real composition has unbalanced contributing
     # cages (58623, 66336, 58627), so the fully sign-flipped labelling is not
     # itself a valid assignment and only the observed one is guaranteed
