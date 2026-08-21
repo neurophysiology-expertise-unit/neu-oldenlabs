@@ -233,8 +233,9 @@ six cages are genotype-mixed.
   Smallest attainable two-sided p = **1/4800 ≈ 0.00021**, not 2/4800: the 2/n
   floor assumes the fully sign-flipped labelling is itself an enumerated
   assignment, which holds only when every contributing cage is genotype-balanced.
-  These cages are 3/2, 3/2, 1/3, 1/1 and 2/2, so the mirror is not enumerated and
-  the floor is 1/n. The code reports 2/n only in the balanced case. This value is
+  These cages are 3/2, 3/2, 1/3, 1/1 and 2/2 — two of them (1/1 and 2/2) are
+  balanced, but three are not, and the condition requires all of them — so the
+  mirror is not enumerated and the floor is 1/n. The code reports 2/n only in the balanced case. This value is
   printed next to every p-value, as `neu-intellicage` does, but here it is a note
   of adequacy rather than of a resolution floor.
 - **Effect size and interval always**, whatever the p-value: Hedges' g plus a
