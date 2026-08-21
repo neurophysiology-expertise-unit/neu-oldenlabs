@@ -807,7 +807,7 @@ def cluster_permutation_scan(long: pd.DataFrame, measures: list, *,
     """
     rows = []
     skipped = []
-    columns = ["measure", "hours", "n_hours", "sign", "mass", "p_value",
+    columns = ["measure", "hours", "hour_list", "n_hours", "sign", "mass", "p_value",
               "n_permutations", "exact", "threshold"]
     for measure in measures:
         if measure not in set(long.get("measure", [])):
@@ -826,6 +826,12 @@ def cluster_permutation_scan(long: pd.DataFrame, measures: list, *,
             rows.append({
                 "measure": measure,
                 "hours": _format_hour_range(cluster["hours"]),
+                # `hour_list` keeps the raw list of integer hours (not just
+                # the compressed display string above) so a programmatic
+                # consumer -- `plots.hour_clusters`, which shades exactly
+                # these hours on the profile figure -- does not have to
+                # re-parse the display string to recover them.
+                "hour_list": cluster["hours"],
                 "n_hours": len(cluster["hours"]),
                 "sign": cluster["sign"],
                 "mass": cluster["mass"],

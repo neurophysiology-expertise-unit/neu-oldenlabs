@@ -156,26 +156,16 @@ def _hourly_value_per_animal(block: pd.DataFrame, measure: str) -> pd.DataFrame:
     return merged[["cage", "tag", "genotype", "hour", "value"]]
 
 
-def phase_profiles(hourly: pd.DataFrame, output: Path, measures: list[str],
-                   lights_on: int = LIGHTS_ON, lights_off: int = LIGHTS_OFF) -> None:
-    """Mean +/- SEM hour-of-day profile per measure, one line per genotype.
+def _hourly_mean_sem_table(hourly: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
+    """Mean, SEM, and n ACROSS ANIMALS, per measure/genotype/hour-of-day.
 
-    `hourly` is the rack-masked long frame joined with genotype (it must carry
-    a `genotype` column already, since only the pipeline knows which animal
-    table applies). One subplot per measure in `measures`.
-
+    Shared by `phase_profiles` and `hour_clusters` so the two figures cannot
+    silently drift apart in how they compute the same underlying numbers.
     Bins are first reduced to one duration-weighted value per ANIMAL at each
     hour-of-day (`_hourly_value_per_animal`), then mean and SEM are computed
-    across those per-animal values. Two things this fixes at once: (1) a flat
-    mean over raw bin values is "per bin", not "per hour", so pooling cages
-    with different bin widths manufactures a difference that is pure bin-width
-    artefact; (2) the experimental unit is the animal, so the SEM must be
-    taken across animals, not across pooled bins from every animal and every
-    day -- pooling bins makes the band far too narrow (the real study's CSV
-    recorded n=1200 for 5 animals) and overstates how precisely the mean is
-    known.
+    across those per-animal values -- see `phase_profiles` for why both
+    steps matter (bin-width artefact and SEM-across-animals-not-bins).
     """
-    measures = [m for m in measures if m in set(hourly.get("measure", []))]
     frame = hourly.copy()
     if not frame.empty:
         frame["hour"] = frame["bin_start"].dt.hour
@@ -188,7 +178,36 @@ def phase_profiles(hourly: pd.DataFrame, output: Path, measures: list[str],
             rows.append({"measure": measure, "genotype": genotype, "hour": hour,
                         "mean": sub["value"].mean(), "sem": sub["value"].sem(),
                         "n": sub["value"].count()})
-    table = pd.DataFrame(rows, columns=["measure", "genotype", "hour", "mean", "sem", "n"])
+    return pd.DataFrame(rows, columns=["measure", "genotype", "hour", "mean", "sem", "n"])
+
+
+def phase_profiles(hourly: pd.DataFrame, output: Path, measures: list[str],
+                   lights_on: int = LIGHTS_ON, lights_off: int = LIGHTS_OFF) -> None:
+    """Mean +/- SEM hour-of-day profile per measure, one line per genotype.
+
+    `hourly` is the rack-masked long frame joined with genotype (it must carry
+    a `genotype` column already, since only the pipeline knows which animal
+    table applies). One subplot per measure in `measures`.
+
+    See `_hourly_mean_sem_table` for how the mean/SEM/n table is built: bins
+    are first reduced to one duration-weighted value per ANIMAL at each
+    hour-of-day, then mean and SEM are computed across those per-animal
+    values. Two things this fixes at once: (1) a flat mean over raw bin
+    values is "per bin", not "per hour", so pooling cages with different bin
+    widths manufactures a difference that is pure bin-width artefact; (2)
+    the experimental unit is the animal, so the SEM must be taken across
+    animals, not across pooled bins from every animal and every day --
+    pooling bins makes the band far too narrow (the real study's CSV
+    recorded n=1200 for 5 animals) and overstates how precisely the mean is
+    known.
+
+    `hour_clusters` is the companion figure: the same mean +/- SEM profile,
+    but with the cluster-permutation test's significant hour-clusters marked
+    -- this figure alone does not test anything; see that function's
+    docstring for the caveat that non-overlapping SEM bands are NOT a test.
+    """
+    measures = [m for m in measures if m in set(hourly.get("measure", []))]
+    table = _hourly_mean_sem_table(hourly, measures)
 
     if not measures:
         fig, ax = plt.subplots(figsize=(6, 2))
@@ -220,6 +239,123 @@ def phase_profiles(hourly: pd.DataFrame, output: Path, measures: list[str],
         ax.set_xlabel("hour of day" if row_index == len(measures) - 1 else "")
         _genotype_legend(ax, present)
     _save(fig, table, output, "phase_profiles")
+
+
+def _cluster_spans(hours: list) -> list:
+    """Contiguous integer-hour runs in `hours` as (start, end) axis spans,
+    each covering that hour's full bin width (hour h covers [h, h+1)).
+
+    `hours` is `groups.cluster_permutation`'s already-circularly-resolved
+    cluster hour list (e.g. [22, 23, 0, 1] for a cluster wrapping midnight).
+    A run that wraps past midnight is split into two spans -- e.g.
+    [22, 23, 0, 1] becomes [(22, 24), (0, 2)] -- so it can be drawn with two
+    ordinary `axvspan` calls on an axis that does not itself wrap.
+    """
+    if not hours:
+        return []
+    ordered = sorted(hours)
+    if len(ordered) == 24:
+        return [(0.0, 24.0)]
+
+    gaps = [(ordered[i + 1] - ordered[i], i) for i in range(len(ordered) - 1)]
+    wrap_gap = (ordered[0] + 24 - ordered[-1], len(ordered) - 1)
+    _, split_index = max(gaps + [wrap_gap], key=lambda item: item[0]) if gaps else wrap_gap
+    rotated = ordered[split_index + 1:] + ordered[:split_index + 1]
+
+    runs = []
+    start = prev = rotated[0]
+    for hour in rotated[1:]:
+        if hour == (prev + 1) % 24:
+            prev = hour
+            continue
+        runs.append((start, prev))
+        start = prev = hour
+    runs.append((start, prev))
+
+    spans = []
+    for a, b in runs:
+        if a <= b:
+            spans.append((float(a), float(b) + 1.0))
+        else:  # wraps past midnight
+            spans.append((float(a), 24.0))
+            spans.append((0.0, float(b) + 1.0))
+    return spans
+
+
+def hour_clusters(hourly: pd.DataFrame, cluster_scan: pd.DataFrame, output: Path,
+                  measures: list[str], lights_on: int = LIGHTS_ON,
+                  lights_off: int = LIGHTS_OFF) -> None:
+    """The `phase_profiles` mean +/- SEM hour-of-day profile, with the
+    cluster-permutation test's significant hour-cluster(s) marked.
+
+    `cluster_scan` is `groups.cluster_permutation_scan`'s output table (one
+    row per OBSERVED cluster that exceeded the cluster-forming threshold,
+    already BH-corrected ACROSS MEASURES in `p_adjusted_bh`) -- this figure
+    only VISUALISES clusters the stats module already found; it recomputes
+    nothing. A cluster is shaded on its measure's panel -- red if
+    `p_adjusted_bh < 0.05`, grey otherwise, matching `effect_forest`'s
+    red/grey convention -- and split across the midnight wrap into two spans
+    when it wraps (`_cluster_spans`). A measure with no row in `cluster_scan`
+    at all (every hour stayed under the cluster-forming threshold, or the
+    measure was skipped -- see `cluster_scan.attrs.get("skipped_measures")`)
+    is plotted with no shading at all.
+
+    CAVEAT, stated here and in the report alongside this figure:
+    non-overlapping SEM bands are NOT themselves a test -- SEM bars that just
+    touch correspond to roughly p ~= 0.3, not p ~= 0.05 (Cumming & Finch
+    2005; the cluster-permutation test is what corrects for both the
+    autocorrelation across 24 hours and the multiple-comparison burden of
+    testing all of them). The shaded cluster(s) here are the actual test
+    result; the mean +/- SEM bands are descriptive only.
+    """
+    measures = [m for m in measures if m in set(hourly.get("measure", []))]
+    table = _hourly_mean_sem_table(hourly, measures)
+
+    if not measures:
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, "no measures available", ha="center", va="center")
+        ax.axis("off")
+        _save(fig, table, output, "hour_clusters")
+        return
+
+    has_clusters = "measure" in cluster_scan.columns and not cluster_scan.empty
+
+    fig, axes = plt.subplots(len(measures), 1, figsize=(6, 2.4 * len(measures)), squeeze=False)
+    present = set(table["genotype"]) if not table.empty else set()
+    for row_index, measure in enumerate(measures):
+        ax = axes[row_index][0]
+        block = table[table["measure"] == measure]
+        for genotype in GENOTYPE_ORDER:
+            line = block[block["genotype"] == genotype].sort_values("hour")
+            if line.empty:
+                continue
+            ax.plot(line["hour"], line["mean"], color=GENOTYPE_COLOR[genotype],
+                   marker="o", markersize=3, linewidth=1.5, label=genotype)
+            ax.fill_between(line["hour"], line["mean"] - line["sem"],
+                            line["mean"] + line["sem"], color=GENOTYPE_COLOR[genotype],
+                            alpha=0.2, linewidth=0)
+        _shade_dark(ax, lights_on, lights_off, span=24)
+        if has_clusters:
+            for cluster in cluster_scan[cluster_scan["measure"] == measure].itertuples():
+                significant = (not pd.isna(cluster.p_adjusted_bh)
+                              and cluster.p_adjusted_bh < 0.05)
+                color = "#d03b3b" if significant else "#8c8c8c"
+                for start, end in _cluster_spans(cluster.hour_list):
+                    ax.axvspan(start, end, color=color, alpha=0.18, zorder=1)
+                label_hour = sorted(cluster.hour_list)[len(cluster.hour_list) // 2]
+                stars = "*" if significant else ""
+                ax.annotate(f"p={cluster.p_value:.3g}{stars}",
+                           xy=(label_hour, 1.0), xycoords=("data", "axes fraction"),
+                           xytext=(0, 2), textcoords="offset points",
+                           ha="center", fontsize=6, color=color)
+        ax.set_xlim(0, 23)
+        label = measure
+        if MEASURE_KIND.get(measure) == "count":
+            label += " (per valid hour)"
+        ax.set_ylabel(label, fontsize=8)
+        ax.set_xlabel("hour of day" if row_index == len(measures) - 1 else "")
+        _genotype_legend(ax, present)
+    _save(fig, table, output, "hour_clusters")
 
 
 def cage_paired(profile: pd.DataFrame, output: Path, measures: list[str]) -> None:

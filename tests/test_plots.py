@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from neu_oldenlabs.io import load_cage
-from neu_oldenlabs.plots import actogram, effect_forest, phase_profiles
+from neu_oldenlabs.plots import _cluster_spans, actogram, effect_forest, hour_clusters, phase_profiles
 
 
 def _cage_with_bin_width(make_workbook, name, cage, minutes, bins, per_bin_value, start):
@@ -220,3 +220,55 @@ def test_effect_forest_passes_through_gs_own_bootstrap_ci_even_when_difference_i
     row = table.iloc[0]
     assert round(float(row["g_ci_low"]), 6) == -0.4
     assert round(float(row["g_ci_high"]), 6) == 0.6
+
+
+def test_cluster_spans_simple_contiguous_block():
+    assert _cluster_spans([2, 3, 4, 5, 6]) == [(2.0, 7.0)]
+
+
+def test_cluster_spans_wraps_midnight_into_two_spans():
+    assert _cluster_spans([22, 23, 0, 1]) == [(22.0, 24.0), (0.0, 2.0)]
+
+
+def test_cluster_spans_all_hours():
+    assert _cluster_spans(list(range(24))) == [(0.0, 24.0)]
+
+
+def test_hour_clusters_writes_a_figure_and_csv_and_shades_the_observed_cluster(tmp_path):
+    start = datetime(2026, 7, 11, 0, 0)
+    rows = []
+    for hour in range(24):
+        for genotype in ("wt", "mut"):
+            for tag in (1, 2):
+                bump = 10.0 if (genotype == "mut" and 2 <= hour <= 6) else 0.0
+                rows.append({
+                    "cage": 1, "tag": tag if genotype == "wt" else tag + 10,
+                    "genotype": genotype, "measure": "distance_cm",
+                    "bin_start": start + pd.Timedelta(hours=hour), "duration_s": 3600.0,
+                    "value": 5.0 + bump,
+                })
+    hourly = pd.DataFrame(rows)
+    cluster_scan = pd.DataFrame([{
+        "measure": "distance_cm", "hours": "2-6", "hour_list": [2, 3, 4, 5, 6],
+        "n_hours": 5, "sign": 1, "mass": 12.0, "p_value": 0.001,
+        "n_permutations": 4800, "exact": True, "threshold": 2.0, "p_adjusted_bh": 0.002,
+    }])
+    output = tmp_path / "figs"
+    hour_clusters(hourly, cluster_scan, output, ["distance_cm"])
+    assert (output / "hour_clusters.png").exists()
+    table = pd.read_csv(output / "hour_clusters.csv")
+    assert set(table["measure"]) == {"distance_cm"}
+
+
+def test_hour_clusters_with_no_clusters_still_writes_the_profile(tmp_path):
+    start = datetime(2026, 7, 11, 0, 0)
+    rows = [{
+        "cage": 1, "tag": 1, "genotype": "wt", "measure": "distance_cm",
+        "bin_start": start + pd.Timedelta(hours=hour), "duration_s": 3600.0, "value": 5.0,
+    } for hour in range(24)]
+    hourly = pd.DataFrame(rows)
+    empty_scan = pd.DataFrame(columns=["measure", "hours", "hour_list", "p_value",
+                                       "p_adjusted_bh"])
+    output = tmp_path / "figs"
+    hour_clusters(hourly, empty_scan, output, ["distance_cm"])
+    assert (output / "hour_clusters.png").exists()
