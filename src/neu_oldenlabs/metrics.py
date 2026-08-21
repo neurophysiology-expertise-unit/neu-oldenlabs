@@ -113,3 +113,70 @@ def restrict_window(table: pd.DataFrame, start=None, end=None) -> pd.DataFrame:
     if end is not None:
         frame = frame[frame["date"] <= pd.Timestamp(end).date()]
     return frame.reset_index(drop=True)
+
+
+def resample_bins(long: pd.DataFrame, bin_s: int) -> pd.DataFrame:
+    """Re-bin a long frame to one common, clock-aligned bin width.
+
+    The real study mixes cage 58616's 600 s bins with the other five cages'
+    3600 s bins; the study owner's ruling is to downsample everything to a
+    common hourly resolution before any metric is computed (`resample_bin_s`
+    in the study configuration). This is that re-binning, applied to the RAW
+    per-bin long frame (one row per cage/tag/bin_start/measure) -- it produces
+    another long frame of the same shape at the new width, so every downstream
+    function (`daily`, `circadian.hourly_activity`, the plots) sees one
+    resolution without having to know resampling happened.
+
+    Target bins are CLOCK-ALIGNED: ``bin_start`` is floored to the nearest
+    multiple of ``bin_s`` seconds (from the epoch, which for a whole-hour
+    ``bin_s`` is the same as flooring to the top of the hour), not aligned to
+    whatever the first source bin happens to start on.
+
+    Aggregation is by ``io.MEASURE_KIND``, exactly as `_aggregate_measure`
+    above does it (rate/mean -> duration-weighted mean, max -> maximum,
+    count -> sum), and is PRESENCE-AWARE in the same way: the duration weight
+    for a target bin counts only SOURCE bins whose value is present
+    (``duration_s.where(value.notna(), 0.0)``, mirrored from line 59 above), so
+    a target bin with no present source bin yields NaN, never the 0.0 that an
+    unguarded ``.sum()``/mean would silently produce for an all-missing group.
+    ``duration_s`` on the output is the summed PRESENT source duration, which
+    is what makes this composable with `_aggregate_measure`'s own duration
+    weighting one level up. Resampling a frame already at the target width is
+    a no-op in value terms: each target group holds exactly one source bin, so
+    every rule above reduces to passing that bin's own value (or NaN) through
+    unchanged.
+
+    Must run AFTER the rack mask is applied (an out-of-rack bin is not an
+    observation and must not contribute to a resampled value) and must never
+    be applied to the ``in_rack`` mask measure itself -- the mask decides which
+    NATIVE bins are valid and is consumed before resampling exists.
+    """
+    columns = ["cage", "tag", "bin_start", "bin_end", "duration_s", "measure", "value"]
+    if long.empty:
+        return long[columns].copy()
+
+    frame = long.copy()
+    frame["bin_start"] = frame["bin_start"].dt.floor(pd.Timedelta(seconds=bin_s))
+    frame["weighted"] = frame["value"] * frame["duration_s"]
+    frame["duration_present"] = frame["duration_s"].where(frame["value"].notna(), 0.0)
+
+    parts = []
+    for measure, block in frame.groupby("measure", sort=False):
+        kind = MEASURE_KIND[measure]
+        grouped = block.groupby(["cage", "tag", "bin_start"], as_index=False).agg(
+            weighted=("weighted", "sum"), seconds=("duration_present", "sum"),
+            total=("value", "sum"), peak=("value", "max"))
+        if kind in ("rate", "mean"):
+            grouped["value"] = grouped["weighted"] / grouped["seconds"].replace(0, np.nan)
+        elif kind == "max":
+            grouped["value"] = grouped["peak"]
+        elif kind == "count":
+            grouped["value"] = grouped["total"].where(grouped["seconds"] > 0, np.nan)
+        else:
+            raise ValueError(f"no resampling rule for measure kind {kind!r}")
+        grouped["measure"] = measure
+        grouped["duration_s"] = grouped["seconds"]
+        grouped["bin_end"] = grouped["bin_start"] + pd.Timedelta(seconds=bin_s)
+        parts.append(grouped[columns])
+
+    return pd.concat(parts, ignore_index=True)

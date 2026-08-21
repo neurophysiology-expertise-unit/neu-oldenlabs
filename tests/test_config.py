@@ -49,3 +49,18 @@ def test_a_missing_required_key_raises(tmp_path):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="lights_on"):
         load_study(path)
+
+
+def test_resample_bin_s_defaults_to_none_when_absent(tmp_path):
+    study = load_study(write_config(tmp_path))
+    assert study.resample_bin_s is None
+
+
+def test_resample_bin_s_is_read_as_an_integer(tmp_path):
+    study = load_study(write_config(tmp_path, resample_bin_s=3600))
+    assert study.resample_bin_s == 3600
+
+
+def test_resample_bin_s_null_stays_none(tmp_path):
+    study = load_study(write_config(tmp_path, resample_bin_s=None))
+    assert study.resample_bin_s is None

@@ -5,7 +5,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from neu_oldenlabs.metrics import add_time_fields, daily, drop_habituation, restrict_window
+from neu_oldenlabs.metrics import (add_time_fields, daily, drop_habituation, resample_bins,
+                                   restrict_window)
 
 
 def frame(rows):
@@ -148,3 +149,74 @@ def test_missing_values_are_excluded_from_the_duration_weight_not_just_the_numer
     table = daily(long)
     value = table[(table["phase"] == "all") & (table["measure"] == "inactive_pct")]["value"]
     assert round(float(value.iloc[0]), 6) == 60.0
+
+
+def test_resample_bins_reproduces_hand_computed_values_for_each_measure_kind():
+    # Two 10-minute-ish source bins (540 s and 660 s), for one rate, one count,
+    # and one max measure, both falling inside the same target hour.
+    long = frame([
+        (1, 1, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 9), 540.0,
+         "inactive_pct", 60.0),
+        (1, 1, datetime(2026, 7, 11, 20, 9), datetime(2026, 7, 11, 20, 20), 660.0,
+         "inactive_pct", 0.0),
+        (1, 1, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 9), 540.0,
+         "distance_cm", 5.0),
+        (1, 1, datetime(2026, 7, 11, 20, 9), datetime(2026, 7, 11, 20, 20), 660.0,
+         "distance_cm", 3.0),
+        (1, 1, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 9), 540.0,
+         "speed_max_cm_s", 5.0),
+        (1, 1, datetime(2026, 7, 11, 20, 9), datetime(2026, 7, 11, 20, 20), 660.0,
+         "speed_max_cm_s", 9.0),
+    ])
+    resampled = resample_bins(long, 3600)
+
+    assert len(resampled) == 3
+    assert resampled["bin_start"].nunique() == 1
+    assert resampled["bin_start"].iloc[0] == datetime(2026, 7, 11, 20, 0)
+    assert resampled["bin_end"].iloc[0] == datetime(2026, 7, 11, 21, 0)
+
+    by_measure = resampled.set_index("measure")
+    # rate/mean: duration-weighted, (60*540 + 0*660) / (540+660) = 27.0.
+    assert round(float(by_measure.loc["inactive_pct", "value"]), 6) == 27.0
+    # count: summed, not converted to a rate here (that happens one level up,
+    # in `_aggregate_measure`/`daily`): 5.0 + 3.0 = 8.0.
+    assert round(float(by_measure.loc["distance_cm", "value"]), 6) == 8.0
+    # max: the maximum of the source bins.
+    assert float(by_measure.loc["speed_max_cm_s", "value"]) == 9.0
+    # duration_s on the output is the summed PRESENT source duration.
+    assert float(by_measure.loc["inactive_pct", "duration_s"]) == 1200.0
+    assert float(by_measure.loc["distance_cm", "duration_s"]) == 1200.0
+    assert float(by_measure.loc["speed_max_cm_s", "duration_s"]) == 1200.0
+
+
+def test_resample_bins_on_an_already_hourly_frame_is_a_value_level_no_op():
+    long = frame([
+        (1, 1, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 21, 0), 3600.0,
+         "distance_cm", 42.0),
+        (1, 1, datetime(2026, 7, 11, 21, 0), datetime(2026, 7, 11, 22, 0), 3600.0,
+         "distance_cm", 17.0),
+    ])
+    resampled = resample_bins(long, 3600).sort_values("bin_start").reset_index(drop=True)
+    original = long.sort_values("bin_start").reset_index(drop=True)
+    assert resampled["value"].tolist() == original["value"].tolist()
+    assert resampled["duration_s"].tolist() == original["duration_s"].tolist()
+    assert resampled["bin_start"].tolist() == original["bin_start"].tolist()
+
+
+def test_resample_bins_yields_nan_not_zero_for_a_target_bin_with_no_present_source_bin():
+    # Every source bin in this target hour is missing, across a rate, a count,
+    # and a max measure -- the resampled value must be NaN for every one of
+    # them, never the 0.0 an unguarded sum/mean would silently produce.
+    long = frame([
+        (1, 4, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 10), 600.0,
+         "distance_cm", np.nan),
+        (1, 4, datetime(2026, 7, 11, 20, 10), datetime(2026, 7, 11, 20, 20), 600.0,
+         "distance_cm", np.nan),
+        (1, 4, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 10), 600.0,
+         "inactive_pct", np.nan),
+        (1, 4, datetime(2026, 7, 11, 20, 0), datetime(2026, 7, 11, 20, 10), 600.0,
+         "speed_max_cm_s", np.nan),
+    ])
+    resampled = resample_bins(long, 3600)
+    assert resampled["value"].isna().all()
+    assert (resampled["duration_s"] == 0.0).all()

@@ -35,6 +35,7 @@ class StudyConfig:
     min_days: int
     primary_measures: tuple[str, ...]
     scan_measures: tuple[str, ...]
+    resample_bin_s: int | None
 
     @property
     def available_cages(self) -> list[CageSpec]:
@@ -76,4 +77,6 @@ def load_study(path: Path) -> StudyConfig:
         min_days=int(payload["min_days"]),
         primary_measures=tuple(payload["primary_measures"]),
         scan_measures=tuple(payload.get("scan_measures") or ()),
+        resample_bin_s=(int(payload["resample_bin_s"])
+                        if payload.get("resample_bin_s") is not None else None),
     )
