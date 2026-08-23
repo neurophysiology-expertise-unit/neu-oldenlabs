@@ -130,7 +130,12 @@ def actogram(profile_long: pd.DataFrame, output: Path, lights_on: int = LIGHTS_O
     for index in range(len(animals), nrows * ncols):
         axes[index // ncols][index % ncols].axis("off")
     if image is not None:
-        fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.6,
+        # Horizontal, below the panels. A right-hand colorbar steals width from
+        # every column of a multi-animal grid and ends up overlapping the
+        # rightmost panels' axes; spanning the bottom costs one strip of height
+        # once, whatever the grid size.
+        fig.colorbar(image, ax=axes.ravel().tolist(), location="bottom",
+                     orientation="horizontal", fraction=0.05, pad=0.12, aspect=40,
                      label="distance_cm (cm / valid hour)")
     _save(fig, table, output, "actogram")
 
