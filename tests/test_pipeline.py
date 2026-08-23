@@ -24,6 +24,21 @@ def test_run_study_produces_profile_and_comparison_tables(synthetic_study, tmp_p
     assert (output / "provenance.json").exists()
 
 
+def test_cluster_permutation_is_wired_into_run_study(synthetic_study, tmp_path):
+    # The cluster-permutation scan (groups.cluster_permutation_scan) must run
+    # for the study's primary measures, land in the result dict, and be
+    # written as its own CSV -- and the companion `hour_clusters` figure must
+    # be produced like every other figure (png + csv).
+    study = synthetic_study
+    output = tmp_path / "out"
+    result = run_study(study, output, cache_dir=None)
+
+    assert "cluster_permutation" in result
+    assert (output / "cluster_permutation.csv").exists()
+    assert (output / "figures" / "hour_clusters.png").exists()
+    assert (output / "figures" / "hour_clusters.csv").exists()
+
+
 def test_missing_cages_are_recorded_not_silently_dropped(synthetic_study, tmp_path):
     result = run_study(synthetic_study, tmp_path / "out", cache_dir=None)
     assert result["missing_cages"] == [1003]

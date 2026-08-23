@@ -201,9 +201,33 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
     phase_measures = list(dict.fromkeys(_base_measure(m) for m in study.primary_measures))
     trajectory_measure = phase_measures[0] if phase_measures else "distance_cm"
 
+    # The cluster-permutation test's own contract (see `groups.cluster_permutation_scan`
+    # and `groups.hourly_profile_by_animal`) calls for a habituation/window-restricted
+    # frame -- unlike `hourly_with_genotype` above, which `phase_profiles` consumes
+    # un-restricted. Built the same way `circadian_long` is (drop_habituation /
+    # restrict_window need a "date" column), then genotype is joined in exactly like
+    # every other figure input above.
+    hourly_restricted = masked_long.copy()
+    hourly_restricted["date"] = hourly_restricted["bin_start"].dt.date
+    hourly_restricted = metrics.drop_habituation(hourly_restricted, study.habituation_days)
+    hourly_restricted = metrics.restrict_window(hourly_restricted, study.window_start, study.window_end)
+    hourly_restricted = hourly_restricted.drop(columns="date").merge(
+        animal_genotypes, on=["cage", "tag"], how="left")
+
+    # Cage-stratified cluster-based permutation test over the 24-hour profile, run
+    # for every primary measure (base name, phase-suffix stripped and deduped -- the
+    # same `phase_measures` list `phase_profiles` uses, since the cluster test already
+    # spans all 24 hours and so subsumes the light/dark/all split). BH-corrected across
+    # measures inside `cluster_permutation_scan` itself; the within-measure, across-24-
+    # hours correction is the max-cluster-mass step inside `groups.cluster_permutation`.
+    cluster_scan_table = groups.cluster_permutation_scan(hourly_restricted, phase_measures)
+    cluster_scan_table.to_csv(output / "cluster_permutation.csv", index=False)
+
     plots.actogram(masked_long, figures, study.lights_on, study.lights_off)
     plots.phase_profiles(hourly_with_genotype, figures, phase_measures,
                          study.lights_on, study.lights_off)
+    plots.hour_clusters(hourly_restricted, cluster_scan_table, figures, phase_measures,
+                        study.lights_on, study.lights_off)
     plots.cage_paired(profile_table, figures, list(study.primary_measures))
     plots.effect_forest(scan_table, figures)
     plots.daily_trajectories(daily_with_genotype, figures, trajectory_measure)
@@ -219,13 +243,14 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
             "window_end": study.window_end, "primary_measures": list(study.primary_measures),
             "scan_measures": list(study.scan_measures),
             "resample_bin_s": study.resample_bin_s,
+            "cluster_forming_threshold": groups.CLUSTER_FORMING_THRESHOLD,
         },
     )
 
     return {
         "long": masked_long, "native_long": native_masked_long, "daily": daily_table,
         "profile": profile_table, "qc": qc_tables, "scan": scan_table,
-        "scan_pooled": scan_table_pooled,
+        "scan_pooled": scan_table_pooled, "cluster_permutation": cluster_scan_table,
         "missing_cages": study.missing_cages, "excluded_tags": excluded_table,
         "resample_bin_s": study.resample_bin_s, "resampled_cages": resampled_cages,
     }
