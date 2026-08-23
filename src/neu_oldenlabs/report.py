@@ -247,8 +247,64 @@ def _quality_control(result: dict) -> str:
 
     lines += [_non_finite_rack_paragraph(result["qc"].get("rack_non_finite")), ""]
     lines += [_excluded_tags_paragraph(result["qc"].get("excluded_tags")), ""]
+    lines += [_distance_resolution_paragraph(result["qc"].get("distance_resolution")), ""]
 
     return "\n".join(lines)
+
+
+def _distance_resolution_paragraph(distance_resolution: pd.DataFrame | None) -> str:
+    """State any NATIVE (pre-resampling) bin-width mismatch and what it taints.
+
+    `distance_cm` is a PATH LENGTH, and path length is sampling-rate dependent
+    (the coastline problem) -- see `qc.distance_resolution_confound`, which
+    this reads verbatim (`result["qc"]["distance_resolution"]`). A finer
+    native resolution captures micro-movement a coarser native resolution
+    never sees, and downstream resampling to a common width
+    (`metrics.resample_bins`) cannot undo it -- the vendor already computed
+    each bin's path length at its own native resolution. This is an expected
+    RESULT for a mixed-resolution study, not an error, so it is stated here
+    plainly rather than left for a reader to discover by noticing a figure
+    looks wrong -- and again next to the pooled-comparison section below,
+    since that is where it actually bites.
+    """
+    if distance_resolution is None or distance_resolution.empty:
+        return ("**Distance-resolution confound.** No bin-width data was "
+                "available to check for a native-resolution mismatch across "
+                "cages.")
+    if not bool(distance_resolution["bin_width_differs_in_study"].any()):
+        return (
+            "**Distance-resolution confound.** Every cage in this run shares "
+            "one NATIVE (pre-resampling) bin width, so `distance_cm` and "
+            "everything built from it (`io.DISTANCE_DERIVED_PROFILE_MEASURES`: "
+            "the circadian family L5, M10, RA, mesor, amplitude, IS, IV, "
+            "acrophase_hour, plus `distance_dark_light_ratio` and "
+            "`distance_cv_daily`) carries no resolution confound in this run."
+        )
+    by_width: dict[float, list[int]] = {}
+    for row in distance_resolution.itertuples():
+        by_width.setdefault(float(row.native_bin_width_s), []).append(int(row.cage))
+    groups_desc = "; ".join(
+        f"{width:.0f} s: cage(s) {', '.join(str(c) for c in sorted(cages))}"
+        for width, cages in sorted(by_width.items()))
+    affected = distance_resolution["distance_derived_measures_affected"].iloc[0]
+    return (
+        "**Distance-resolution confound.** Cages in this run differ in NATIVE "
+        f"(pre-resampling) bin width: {groups_desc}. `distance_cm` is a PATH "
+        "LENGTH, which is sampling-rate dependent (the coastline problem): a "
+        "finer native resolution captures micro-movement the same behaviour, "
+        "recorded natively at a coarser resolution, never sees, and "
+        "`metrics.resample_bins` cannot undo this after the fact -- the "
+        "vendor already computed each bin's path length at its own native "
+        f"resolution before this pipeline ever sees it. Affected measures: "
+        f"{affected}. A WITHIN-CAGE (cage-stratified) comparison of these "
+        "measures remains valid -- see `group_comparison.csv` -- because "
+        "every cage's own bins share one native width, so a within-cage "
+        "difference is never a resolution artefact. A POOLED or other "
+        "cross-cage comparison of any of these measures is NOT safe: see the "
+        "`pooled_distance_bin_width_confound` column in "
+        "`group_comparison_pooled.csv` (True marks exactly the affected "
+        "rows) and the Secondary analysis section below."
+    )
 
 
 def _non_finite_rack_paragraph(non_finite: pd.DataFrame | None) -> str:
@@ -937,9 +993,13 @@ def _cluster_permutation_section(study: StudyConfig, result: dict) -> str:
 
 
 # Split, like the primary-measures and full-scan tables in `_results`, so
-# neither block overflows the page; both repeat `measure`.
+# neither block overflows the page; both repeat `measure`. Both EFFECT lists
+# carry `pooled_distance_bin_width_confound` right after `measure` -- see
+# `qc.distance_resolution_confound` / `groups.compare_pooled` -- so a reader
+# scanning either rendered table sees the flag before the numbers it
+# qualifies, not just in the raw `group_comparison_pooled.csv`.
 _POOLED_COMPARISON_EFFECT_COLUMNS = [
-    "measure", "difference", "ci_low", "ci_high",
+    "measure", "pooled_distance_bin_width_confound", "difference", "ci_low", "ci_high",
     "pooled_difference", "pooled_ci_low", "pooled_ci_high",
 ]
 _POOLED_COMPARISON_INFERENCE_COLUMNS = [
@@ -949,7 +1009,8 @@ _POOLED_COMPARISON_INFERENCE_COLUMNS = [
 ]
 
 _POOLED_SCAN_EFFECT_COLUMNS = [
-    "measure", "n_mut", "n_wt", "pooled_mean_mut", "pooled_mean_wt",
+    "measure", "pooled_distance_bin_width_confound", "n_mut", "n_wt",
+    "pooled_mean_mut", "pooled_mean_wt",
     "pooled_difference", "pooled_ci_low", "pooled_ci_high",
 ]
 _POOLED_SCAN_INFERENCE_COLUMNS = [
@@ -984,6 +1045,8 @@ def _secondary_pooled_analysis(study: StudyConfig, result: dict) -> str:
         "primary analysis uses precisely because cages differ for reasons that "
         "have nothing to do with genotype. As a result, this analysis CANNOT "
         "separate a genotype effect from a cage effect confounded with genotype.",
+        "",
+        _distance_resolution_paragraph(result["qc"].get("distance_resolution")),
         "",
     ]
 
