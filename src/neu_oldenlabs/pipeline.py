@@ -223,6 +223,26 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
     cluster_scan_table = groups.cluster_permutation_scan(hourly_restricted, phase_measures)
     cluster_scan_table.to_csv(output / "cluster_permutation.csv", index=False)
 
+    # `cluster_permutation_scan`'s own table only carries n_permutations/exact for a
+    # measure that produced at least one observed cluster -- a measure where every
+    # hour stayed under the threshold contributes no row at all (see its docstring).
+    # The report still needs an honest permutation count for THAT measure too (not
+    # fabricated, not silently borrowed from a different measure), so
+    # `groups.cluster_permutation` is called directly here, once per tested measure,
+    # exactly as `cluster_permutation_scan` already calls it internally -- this
+    # duplicates that work, but the design's cage composition (see the module
+    # docstring: a few thousand within-cage label assignments, enumerated exactly)
+    # makes it cheap.
+    cluster_permutation_detail: dict[str, dict] = {}
+    for measure in phase_measures:
+        if measure not in set(hourly_restricted.get("measure", [])):
+            continue
+        try:
+            hourly_measure = groups.hourly_profile_by_animal(hourly_restricted, measure)
+            cluster_permutation_detail[measure] = groups.cluster_permutation(hourly_measure)
+        except ValueError:
+            continue
+
     plots.actogram(masked_long, figures, study.lights_on, study.lights_off)
     plots.phase_profiles(hourly_with_genotype, figures, phase_measures,
                          study.lights_on, study.lights_off)
@@ -251,6 +271,7 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
         "long": masked_long, "native_long": native_masked_long, "daily": daily_table,
         "profile": profile_table, "qc": qc_tables, "scan": scan_table,
         "scan_pooled": scan_table_pooled, "cluster_permutation": cluster_scan_table,
+        "cluster_permutation_detail": cluster_permutation_detail,
         "missing_cages": study.missing_cages, "excluded_tags": excluded_table,
         "resample_bin_s": study.resample_bin_s, "resampled_cages": resampled_cages,
     }

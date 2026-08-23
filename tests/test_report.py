@@ -22,6 +22,28 @@ def test_report_names_missing_cages_and_the_permutation_count(synthetic_study, t
     assert "min_attainable_p" in text or "smallest attainable" in text.lower()
 
 
+def test_report_describes_the_cluster_permutation_test(synthetic_study, tmp_path):
+    text = build_study_report(synthetic_study, tmp_path / "out").read_text()
+    lower = text.lower()
+    assert "hour-of-day cluster permutation test" in lower
+    assert "distance_cm" in text                 # the tested primary measure, named
+    assert "cluster-forming threshold" in lower
+    assert "not tuned" in lower
+    assert "within cage" in lower
+    assert "circular" in lower and "wrap" in lower
+    assert "animals, not animal-hours" in lower
+    assert "not themselves a significance test" in lower
+    assert "p ~= 0.3" in text or "p ≈ 0.3" in text
+    assert "permutations." in lower              # states how many were used
+
+
+def test_report_cluster_section_works_on_an_all_wildtype_study(all_wildtype_study, tmp_path):
+    # No cage houses both genotypes, so every measure is skipped inside
+    # `groups.cluster_permutation_scan` -- the section must still render, not raise.
+    text = build_study_report(all_wildtype_study, tmp_path / "out").read_text()
+    assert "hour-of-day cluster permutation test" in text.lower()
+
+
 def test_report_states_the_dyadic_caveat_for_social_measures(synthetic_study, tmp_path):
     text = build_study_report(synthetic_study, tmp_path / "out").read_text().lower()
     assert "social distance" in text and "cage-mate" in text

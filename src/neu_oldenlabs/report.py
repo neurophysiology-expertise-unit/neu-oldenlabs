@@ -29,6 +29,11 @@ _FIGURES = [
                  "night phase shaded."),
     ("phase_profiles", "24-hour genotype mean +/- SEM profile, per primary measure, "
                        "night phase shaded."),
+    ("hour_clusters", "The same 24-hour mean +/- SEM profile, with the cluster-based "
+                      "permutation test's observed hour-cluster(s) shaded -- red if "
+                      "FDR q < 0.05, grey otherwise. The SEM band by itself is NOT a "
+                      "significance test -- see Hour-of-day cluster permutation test "
+                      "below."),
     ("cage_paired", "Cage-paired dot plot: animals as points, grouped by cage and "
                     "coloured by genotype -- the same contrast the statistics test."),
     ("effect_forest", "Effect-size forest: stratified difference and its 95% cluster "
@@ -670,6 +675,216 @@ def _results(study: StudyConfig, result: dict, output: Path) -> str:
     return "\n".join(lines)
 
 
+_CLUSTER_EFFECT_COLUMNS = ["measure", "hours", "n_hours", "sign", "mass"]
+_CLUSTER_INFERENCE_COLUMNS = ["measure", "p_value", "p_stars", "p_adjusted_bh", "fdr_stars",
+                              "n_permutations", "exact"]
+
+
+def _whole_day_row(scan: pd.DataFrame, primary_measure: str):
+    """The whole-day stratified-scan row for one phase-suffixed primary measure,
+    or None if the scan carries no `measure` column (e.g. the all-wildtype
+    skip path) or that measure produced no row."""
+    if "measure" not in scan.columns:
+        return None
+    match = scan[scan["measure"] == primary_measure]
+    return None if match.empty else match.iloc[0]
+
+
+def _cluster_permutation_section(study: StudyConfig, result: dict) -> str:
+    """Hour-of-day cluster-based permutation test -- companion to the primary
+    (whole-day) cage-stratified comparison in `_results` above.
+
+    Every number here is read off `result["cluster_permutation"]`
+    (`groups.cluster_permutation_scan`'s table, BH-corrected across measures) and
+    `result["cluster_permutation_detail"]` (`groups.cluster_permutation` called
+    directly per measure -- kept because the scan table only carries a
+    permutation count for a measure that actually produced a cluster; a measure
+    with none still needs an honest count, not a borrowed one -- see
+    `pipeline.run_study`), never typed by hand, so this section cannot drift
+    from the analysis that was actually run.
+    """
+    cluster = result["cluster_permutation"]
+    detail = result["cluster_permutation_detail"]
+    scan = result["scan"]
+
+    base_to_primary: dict[str, list[str]] = {}
+    for measure in study.primary_measures:
+        base_to_primary.setdefault(_base_measure(measure), []).append(measure)
+    tested = list(base_to_primary)
+
+    lines = [
+        "## Hour-of-day cluster permutation test (companion to the primary comparison)",
+        "",
+        "The whole-day comparison above collapses each measure to one number; a "
+        "genotype difference confined to particular hours of the day can average "
+        "out to nothing in that number. This test looks for exactly that pattern.",
+        "",
+        "**What it does.** At each of the 24 clock hours, the same cage-stratified "
+        "weighted genotype difference the primary comparison uses "
+        "(`groups.stratified_difference`'s statistic) is computed. Contiguous runs "
+        "of hours whose standardised difference exceeds a threshold form a "
+        "cluster; a cluster's mass is the summed statistic of its member hours. "
+        "The null distribution comes from permuting genotype labels WITHIN CAGE "
+        "(never across cages, matching the primary test's own design) and "
+        "recomputing the maximum absolute cluster mass on every permutation; an "
+        "observed cluster's p-value is the fraction of permuted maxima at least "
+        "as large as its own mass.",
+        "",
+    ]
+
+    threshold = groups.CLUSTER_FORMING_THRESHOLD
+    if detail:
+        threshold = next(iter(detail.values()))["threshold"]
+    lines += [
+        f"**The cluster-forming threshold is a DECLARED parameter, not tuned to "
+        f"this study's data: {threshold:g} null standard deviations from that "
+        "hour's own null mean.** It was fixed before this test was run on this "
+        "study's data, not chosen after seeing the result.",
+        "",
+        "**Taking the maximum cluster mass over the permutation null is what "
+        "corrects for testing all 24 hours -- and however many clusters happen "
+        "to form -- at once**, the max-statistic correction standard to "
+        "cluster-based permutation tests (Maris & Oostenveld 2007). Clock hours "
+        "are CIRCULAR (hour 23 is adjacent to hour 0), so a cluster may wrap "
+        "midnight; both the test and the figure below handle that explicitly.",
+        "",
+        "**n is animals, not animal-hours.** Each animal contributes exactly ONE "
+        "value per clock hour -- averaged across every day it was recorded -- "
+        "before any statistic sees the data, so the sample size at every hour is "
+        "the number of animals, never the far larger count of animal-hours.",
+        "",
+        "**Non-overlapping SEM bands in the figure below are NOT themselves a "
+        "significance test.** SEM error bars that merely touch correspond to "
+        "roughly p ~= 0.3, not p ~= 0.05 (Cumming & Finch 2005); roughly +/-2 "
+        "standard errors of separation between the two genotype means is needed "
+        "for p ~= 0.05. The shaded cluster(s) below, where present, are the "
+        "actual test result -- the mean +/- SEM band by itself is descriptive "
+        "only.",
+        "",
+    ]
+
+    if detail:
+        signatures = {(d["exact"], d["n_permutations"]) for d in detail.values()}
+        if len(signatures) == 1:
+            exact, n_permutations = next(iter(signatures))
+            method = "enumerated EXACTLY" if exact else "SAMPLED (`neu_oldenlabs.RNG_SEED`)"
+            lines += [
+                f"**Permutations.** {n_permutations:,} within-cage label "
+                f"assignments, {method}, used for every measure tested below.",
+                "",
+            ]
+        else:
+            parts = [f"{measure}: {d['n_permutations']:,} "
+                    f"({'exact' if d['exact'] else 'sampled'})"
+                    for measure, d in detail.items()]
+            lines += [
+                "**Permutations.** The count varies by measure (a measure's own "
+                "missing-hour dropout can change cage composition): "
+                + "; ".join(parts) + ".",
+                "",
+            ]
+    else:
+        lines += ["**Permutations.** No measure was successfully tested below.", ""]
+
+    if not tested:
+        lines += ["No primary measures were configured, so this test did not run.", ""]
+        return "\n".join(lines)
+
+    has_cluster_rows = "measure" in cluster.columns and not cluster.empty
+    if has_cluster_rows:
+        cluster_display = _with_significance_stars(cluster, "p_value", "p_adjusted_bh",
+                                                    "p_stars", "fdr_stars")
+        lines += [
+            "### Observed clusters, all tested measures",
+            "",
+            "**Effect sizes:**",
+            "",
+            _markdown_table(cluster_display, _CLUSTER_EFFECT_COLUMNS),
+            "",
+            "**Inference:**",
+            "",
+            _markdown_table(cluster_display, _CLUSTER_INFERENCE_COLUMNS),
+            "",
+            _STAR_LEGEND,
+            "",
+        ]
+    else:
+        cluster_display = cluster
+        lines += [
+            "*(No hour-cluster exceeded the threshold for any tested measure.)*",
+            "",
+        ]
+
+    lines += ["### Per-measure comparison against the whole-day result", ""]
+    for measure in tested:
+        primaries = base_to_primary[measure]
+        whole_day_rows = {primary: _whole_day_row(scan, primary) for primary in primaries}
+        whole_day_parts = []
+        for primary, row in whole_day_rows.items():
+            if row is None:
+                whole_day_parts.append(f"{primary}: not available in the whole-day scan")
+            else:
+                whole_day_parts.append(
+                    f"{primary}: p={_format_p(row['p_value'])}, "
+                    f"q={_format_p(row['p_adjusted_bh'])} whole-day")
+        whole_day_text = "; ".join(whole_day_parts)
+        whole_day_significant = any(
+            row is not None and not pd.isna(row["p_adjusted_bh"]) and row["p_adjusted_bh"] < 0.05
+            for row in whole_day_rows.values())
+
+        if measure not in detail:
+            lines += [
+                f"**{measure}.** Not tested for an hour-cluster (absent from this "
+                f"study's export, or no loaded cage contains both genotypes). "
+                f"Whole-day: {whole_day_text}.",
+                "",
+            ]
+            continue
+
+        measure_clusters = (cluster_display[cluster_display["measure"] == measure]
+                            if has_cluster_rows else cluster_display.iloc[0:0])
+        if measure_clusters.empty:
+            lines += [
+                f"**{measure}.** No hour-cluster exceeded the threshold. "
+                f"Whole-day: {whole_day_text}.",
+                "",
+            ]
+            continue
+
+        cluster_parts = []
+        any_significant = False
+        for row in measure_clusters.itertuples():
+            significant = not pd.isna(row.p_adjusted_bh) and row.p_adjusted_bh < 0.05
+            any_significant = any_significant or significant
+            wraps = " (wraps midnight)" if "," in str(row.hours) else ""
+            cluster_parts.append(
+                f"hours {row.hours}{wraps} (sign {'+' if row.sign > 0 else '-'}, "
+                f"mass {row.mass:.3g}, p={_format_p(row.p_value)}, "
+                f"q={_format_p(row.p_adjusted_bh)})")
+        clusters_text = "; ".join(cluster_parts)
+
+        flag = ""
+        if any_significant and not whole_day_significant:
+            flag = (" This measure shows a significant hour-cluster with NO "
+                    "significant whole-day effect -- exactly the pattern this "
+                    "test exists to detect.")
+        lines += [
+            f"**{measure}.** Hour-cluster(s): {clusters_text}. "
+            f"Whole-day: {whole_day_text}.{flag}",
+            "",
+        ]
+
+    if has_cluster_rows:
+        skipped = (cluster["skipped_measures"].iloc[0]
+                  if "skipped_measures" in cluster.columns else "")
+    else:
+        skipped = "; ".join(cluster.attrs.get("skipped_measures", []) or [])
+    if skipped:
+        lines += [f"Measures/hours skipped by the cluster scan: {skipped}.", ""]
+
+    return "\n".join(lines)
+
+
 # Split, like the primary-measures and full-scan tables in `_results`, so
 # neither block overflows the page; both repeat `measure`.
 _POOLED_COMPARISON_EFFECT_COLUMNS = [
@@ -990,6 +1205,7 @@ def build_study_report(study: StudyConfig, output: Path, cache_dir: Path | None 
         _quality_control(result),
         _methods(study, result),
         _results(study, result, output),
+        _cluster_permutation_section(study, result),
         _secondary_pooled_analysis(study, result),
         _safeguards(study, result),
     ]
