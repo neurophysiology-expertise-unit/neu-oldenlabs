@@ -31,17 +31,31 @@ LIGHTS_ON = 7
 LIGHTS_OFF = 19
 
 
-def _save(fig, table: pd.DataFrame, output: Path, name: str) -> None:
+def _save(fig, table: pd.DataFrame, output: Path, name: str, colorbar=None) -> None:
+    """Write the figure and the values behind it.
+
+    ``colorbar`` is ``(mappable, label)`` for figures that need one spanning the
+    whole grid. It is drawn HERE, after the panels are laid out, into a band
+    reserved at the bottom of the figure. Creating it earlier with
+    ``fig.colorbar(ax=...)`` does not work: the ``tight_layout`` pass below then
+    re-lays-out the panels and leaves the bar wherever it finds room, which on a
+    ragged grid (25 animals in 3 columns is 8 full rows plus 1) means drawn on
+    top of the panels.
+    """
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     table.to_csv(output / f"{name}.csv", index=False)
-    with warnings.catch_warnings():
-        # A figure-spanning colorbar (actogram) legitimately steals space from
-        # multiple Axes, which tight_layout cannot account for; this is a
-        # known, benign interaction, not a real layout problem.
-        warnings.filterwarnings("ignore", message="This figure includes Axes that are "
-                                "not compatible with tight_layout")
+    if colorbar is None:
         fig.tight_layout()
+    else:
+        mappable, label = colorbar
+        # A fixed ~0.9 inch band, expressed as a fraction of this figure's own
+        # height, so it stays the same physical size whatever the grid size.
+        band = min(0.9 / fig.get_figheight(), 0.25)
+        fig.tight_layout(rect=(0, band, 1, 1))
+        # Sit the bar high enough in the band that its label clears the figure edge.
+        cax = fig.add_axes((0.25, band * 0.62, 0.50, min(band * 0.16, 0.01)))
+        fig.colorbar(mappable, cax=cax, orientation="horizontal", label=label)
     fig.savefig(output / f"{name}.png", dpi=180)
     plt.close(fig)
 
@@ -129,15 +143,8 @@ def actogram(profile_long: pd.DataFrame, output: Path, lights_on: int = LIGHTS_O
         ax.set_xlim(0, 24)
     for index in range(len(animals), nrows * ncols):
         axes[index // ncols][index % ncols].axis("off")
-    if image is not None:
-        # Horizontal, below the panels. A right-hand colorbar steals width from
-        # every column of a multi-animal grid and ends up overlapping the
-        # rightmost panels' axes; spanning the bottom costs one strip of height
-        # once, whatever the grid size.
-        fig.colorbar(image, ax=axes.ravel().tolist(), location="bottom",
-                     orientation="horizontal", fraction=0.05, pad=0.12, aspect=40,
-                     label="distance_cm (cm / valid hour)")
-    _save(fig, table, output, "actogram")
+    bar = (image, "distance_cm (cm / valid hour)") if image is not None else None
+    _save(fig, table, output, "actogram", colorbar=bar)
 
 
 def _hourly_value_per_animal(block: pd.DataFrame, measure: str) -> pd.DataFrame:
