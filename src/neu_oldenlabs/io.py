@@ -95,6 +95,43 @@ MEASURE_KIND = {
 
 PERCENT_MEASURES = tuple(slug for slug in MEASURE_KIND if slug.endswith("_pct"))
 
+# Every `profile.build_profile` output column that is computed, directly or
+# transitively, from `distance_cm`. `distance_cm` is a PATH LENGTH, and path
+# length is sampling-rate dependent (the coastline problem): a cage recorded
+# at a finer NATIVE bin width sums more micro-movement into its path length
+# than the same behaviour recorded natively at a coarser width, and
+# `metrics.resample_bins` cannot undo this after the fact -- the vendor
+# already computed each bin's path length at its own native resolution
+# before this pipeline ever sees it (see `qc.distance_resolution_confound`).
+#
+# This list is enumerated BY HAND from the code, not guessed by matching
+# "distance" in the column name -- that heuristic would both over- and
+# under-match: `social_distance_cm_all` contains "distance" in its name but is
+# a distinct raw measure (animal-to-animal proximity, not path length) never
+# built from `distance_cm`, while `L5`, `M10`, `RA`, `mesor`, `amplitude`,
+# `IS`, `IV`, and `acrophase_hour` contain no "distance" substring at all yet
+# are entirely built from it via `circadian.hourly_activity`, which reads only
+# the `distance_cm` measure.
+#
+# - `distance_cm_all` / `distance_cm_light` / `distance_cm_dark`: the raw
+#   measure itself, phase-suffixed by `profile.build_profile`'s pivot.
+# - `distance_dark_light_ratio`: `distance_cm_dark` / `distance_cm_light`
+#   (`profile.build_profile`).
+# - `distance_cv_daily`: coefficient of variation of daily `distance_cm`
+#   values (`profile.build_profile`).
+# - `mesor`, `amplitude`, `acrophase_hour`: the cosinor fit over hourly
+#   distance (`circadian.cosinor`).
+# - `IS`, `IV`: interdaily stability / intradaily variability over hourly
+#   distance (`circadian.interdaily_stability`, `circadian.intradaily_variability`).
+# - `L5`, `M10`, `RA`: lowest-5-hour / highest-10-hour mean and relative
+#   amplitude of the mean daily hourly-distance profile
+#   (`circadian.relative_amplitude`).
+DISTANCE_DERIVED_PROFILE_MEASURES = (
+    "distance_cm_all", "distance_cm_light", "distance_cm_dark",
+    "distance_dark_light_ratio", "distance_cv_daily",
+    "mesor", "amplitude", "acrophase_hour", "IS", "IV", "L5", "M10", "RA",
+)
+
 # The published definition of each exported measure, from the instrument paper:
 # Delalic, Florea et al. (2025), "Smart Lids for deep multi-animal phenotyping in
 # standard home cages", Front. Behav. Neurosci., doi:10.3389/fnbeh.2025.1696654

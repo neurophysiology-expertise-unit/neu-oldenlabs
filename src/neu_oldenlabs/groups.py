@@ -21,6 +21,7 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from . import RNG_SEED
 from . import metrics
+from .io import DISTANCE_DERIVED_PROFILE_MEASURES
 
 
 def _split(values: pd.DataFrame) -> pd.DataFrame:
@@ -998,7 +999,8 @@ def pooled_bootstrap_ci(values: pd.DataFrame, draws: int = 5000,
     return float(np.quantile(diffs, tail)), float(np.quantile(diffs, 1 - tail))
 
 
-def compare_pooled(profile: pd.DataFrame, measure: str) -> dict:
+def compare_pooled(profile: pd.DataFrame, measure: str,
+                   bin_width_confound: bool = False) -> dict:
     """The pooled, cage-ignoring counterpart to `compare`.
 
     SECONDARY analysis, run at the study owner's explicit request -- see the
@@ -1010,6 +1012,19 @@ def compare_pooled(profile: pd.DataFrame, measure: str) -> dict:
     which name the same quantity as `compare`'s and are kept unprefixed so
     the two tables can be joined on them) precisely so a pooled row can never
     be confused with a stratified one when the two sit side by side.
+
+    `bin_width_confound` -- whether ANY loaded cage's native (pre-resampling)
+    bin width differs from another's in this study (see
+    `qc.distance_resolution_confound`) -- is a study-level fact the caller
+    (`pipeline.run_study`) passes in; this function only decides whether THIS
+    measure is one of the ones the confound taints
+    (`io.DISTANCE_DERIVED_PROFILE_MEASURES`). `distance_cm` is a path length,
+    which is sampling-rate dependent (the coastline problem), so a POOLED
+    comparison of a distance-derived measure across cages of different native
+    resolution is not safe even though the within-cage (stratified) `compare`
+    above is unaffected -- `pooled_distance_bin_width_confound` marks exactly
+    that row, never the stratified table (flagging the stratified table would
+    be wrong: it is unaffected by construction).
     """
     values = profile[["animal_id", "cage", "genotype", measure]].rename(
         columns={measure: "value"}).dropna(subset=["value"])
@@ -1034,6 +1049,8 @@ def compare_pooled(profile: pd.DataFrame, measure: str) -> dict:
         "pooled_hedges_g": pooled_hedges_g(values),
         "pooled_p_value": p_value, "pooled_draws": draws,
         "pooled_min_attainable_p": floor,
+        "pooled_distance_bin_width_confound":
+            bool(bin_width_confound and measure in DISTANCE_DERIVED_PROFILE_MEASURES),
     }
     assert list(row.keys()) == _COMPARE_POOLED_COLUMNS, (
         "_COMPARE_POOLED_COLUMNS (the hand-maintained duplicate used to give an "
@@ -1054,10 +1071,12 @@ _COMPARE_POOLED_COLUMNS = [
     "pooled_mean_mut", "pooled_mean_wt", "pooled_difference",
     "pooled_ci_low", "pooled_ci_high", "pooled_hedges_g",
     "pooled_p_value", "pooled_draws", "pooled_min_attainable_p",
+    "pooled_distance_bin_width_confound",
 ]
 
 
-def scan_pooled(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
+def scan_pooled(profile: pd.DataFrame, measures: list[str],
+                bin_width_confound: bool = False) -> pd.DataFrame:
     """Run `compare_pooled` over every measure and rank by pooled p-value.
 
     Mirrors `scan`'s shape and skip behaviour exactly (absent/constant/no-
@@ -1066,6 +1085,11 @@ def scan_pooled(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
     module note above. BH correction is applied over the same scanned set,
     in its own `pooled_p_adjusted_bh` column so it cannot be confused with
     the stratified scan's `p_adjusted_bh`.
+
+    `bin_width_confound` is passed straight through to `compare_pooled` for
+    every measure -- see its docstring: a study-level fact (do any two loaded
+    cages differ in native bin width?) that `compare_pooled` turns into a
+    per-row, per-measure flag via `io.DISTANCE_DERIVED_PROFILE_MEASURES`.
     """
     rows, skipped = [], []
     for measure in measures:
@@ -1076,7 +1100,7 @@ def scan_pooled(profile: pd.DataFrame, measures: list[str]) -> pd.DataFrame:
             skipped.append(f"{measure} (constant)")
             continue
         try:
-            rows.append(compare_pooled(profile, measure))
+            rows.append(compare_pooled(profile, measure, bin_width_confound))
         except ValueError as error:
             skipped.append(f"{measure} ({error})")
     if not rows:

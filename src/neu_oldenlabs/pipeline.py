@@ -126,6 +126,19 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
 
     qc_tables = qc.qc_tables(raw_long)
     qc_tables["excluded_tags"] = excluded_table
+
+    # `distance_resolution` (from `qc.distance_resolution_confound`, run on the
+    # RAW frame before any resampling) is a study-level fact -- do any two
+    # loaded cages differ in NATIVE bin width? -- that the pooled scan below
+    # needs in order to flag distance-derived measures per row (see
+    # `groups.scan_pooled`, `groups.compare_pooled`). `distance_cm` is a path
+    # length, sampling-rate dependent, and `metrics.resample_bins` cannot undo
+    # a mismatch already baked into the vendor's native per-bin path length.
+    distance_resolution = qc_tables["distance_resolution"]
+    bin_width_confound = (
+        bool(distance_resolution["bin_width_differs_in_study"].any())
+        if not distance_resolution.empty else False)
+
     native_masked_long = qc.apply_rack_mask(raw_long)
 
     masked_long = native_masked_long
@@ -186,7 +199,7 @@ def run_study(study: StudyConfig, output: Path, cache_dir: Path | None = None) -
     # genotypes -- `groups.scan_pooled` skips, per-measure, with a recorded
     # reason, exactly like `groups.scan` does when that is not the case (e.g.
     # `all_wildtype_study`, which has zero mutants at all).
-    scan_table_pooled = groups.scan_pooled(profile_table, measures)
+    scan_table_pooled = groups.scan_pooled(profile_table, measures, bin_width_confound)
     scan_table_pooled.to_csv(output / "group_comparison_pooled.csv", index=False)
 
     daily_table.to_csv(output / "daily_measures.csv", index=False)

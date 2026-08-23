@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .io import MEASURE_KIND, PERCENT_MEASURES
+from .io import DISTANCE_DERIVED_PROFILE_MEASURES, MEASURE_KIND, PERCENT_MEASURES
 
 
 def valid_bins(long: pd.DataFrame) -> pd.DataFrame:
@@ -96,6 +96,77 @@ def bin_regularity(long: pd.DataFrame) -> pd.DataFrame:
     bins = long.drop_duplicates(subset=["cage", "bin_start"])
     return (bins.groupby(["cage", "duration_s"], as_index=False)
             .size().rename(columns={"size": "bins"}))
+
+
+def native_bin_width(long: pd.DataFrame) -> pd.DataFrame:
+    """Per cage: the modal (most-populous) NATIVE bin duration, in seconds.
+
+    `bin_regularity` already reports one row per (cage, duration_s) observed
+    in the raw export -- almost always a single row per cage, since a cage's
+    bins are normally all one width. This collapses that to one row per cage
+    by taking the duration the most bins actually share, defensively, in case
+    a handful of bins in some export ever carries a different span.
+
+    Must be called on the RAW frame, before any `metrics.resample_bins`
+    re-binning: "native" means what the vendor actually recorded, not this
+    study's downstream analysis resolution -- see `distance_resolution_confound`.
+    """
+    regularity = bin_regularity(long)
+    if regularity.empty:
+        return pd.DataFrame(columns=["cage", "native_bin_width_s"])
+    widest = regularity.loc[regularity.groupby("cage")["bins"].idxmax(),
+                            ["cage", "duration_s"]]
+    return widest.rename(columns={"duration_s": "native_bin_width_s"}).reset_index(drop=True)
+
+
+def distance_resolution_confound(long: pd.DataFrame) -> pd.DataFrame:
+    """Flag cages whose NATIVE (pre-resampling) bin width differs from the rest.
+
+    `distance_cm` is a PATH LENGTH, and path length is sampling-rate dependent
+    -- the coastline problem: summing many short-bin path-length estimates
+    captures micro-movement that the same behaviour, recorded at a coarser
+    native resolution, never sees, because the vendor already computed each
+    bin's path length at ITS OWN native resolution before this pipeline ever
+    touches the data. `metrics.resample_bins` (the downstream re-binning to a
+    common width) cannot undo this: it can only average already-inflated
+    finer-resolution path lengths down to a coarser cadence, not recover the
+    coarser-resolution path length that would have been measured natively.
+
+    Measured on the real study (WILDTYPE animals only, so genotype cannot
+    explain the gap): cage 58616, natively at 600 s bins, reads L5 (lowest
+    5-hour mean of hourly distance) 1.54x the other five cages' (natively
+    3600 s) L5, with zero overlap between the two groups; M10 (highest 10-hour
+    mean) only 1.03x. The inflation concentrates in the nadir because
+    quiet-hour movement is almost all micro-movement, while peak-hour movement
+    is dominated by large translations the coarser resolution already
+    captures well.
+
+    This is not a data-quality defect to repair -- a mixed-vendor-resolution
+    study is an expected RESULT, not an error -- so it is reported, never
+    raised, and the run completes either way.
+
+    Returns one row per cage: its native bin width, whether ANY cage in this
+    study has a different native width (a study-level fact, repeated on every
+    row so a reader scanning the CSV sees it without cross-referencing
+    anything else), and the fixed list of profile measures the mismatch
+    taints (`io.DISTANCE_DERIVED_PROFILE_MEASURES` -- `distance_cm` itself and
+    everything the circadian family builds from it). A WITHIN-CAGE
+    (cage-stratified) comparison of these measures stays valid regardless --
+    every cage's own bins share one native width, so a within-cage difference
+    is never a resolution artefact -- only a POOLED or other cross-cage
+    comparison is unsafe. Empty input returns an empty frame with the same
+    columns.
+    """
+    columns = ["cage", "native_bin_width_s", "bin_width_differs_in_study",
+              "distance_derived_measures_affected"]
+    widths = native_bin_width(long)
+    if widths.empty:
+        return pd.DataFrame(columns=columns)
+    differs = bool(widths["native_bin_width_s"].nunique() > 1)
+    widths["bin_width_differs_in_study"] = differs
+    widths["distance_derived_measures_affected"] = (
+        ", ".join(DISTANCE_DERIVED_PROFILE_MEASURES) if differs else "")
+    return widths[columns]
 
 
 def recording_breaks(long: pd.DataFrame, threshold_min: float | None = None,
@@ -214,4 +285,5 @@ def qc_tables(long: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {"rack": rack_summary(long), "regularity": bin_regularity(long),
             "breaks": recording_breaks(long), "coverage": coverage(masked),
             "ranges": range_violations(long), "missing": missing_values(long),
-            "rack_non_finite": non_finite_rack(long)}
+            "rack_non_finite": non_finite_rack(long),
+            "distance_resolution": distance_resolution_confound(long)}
