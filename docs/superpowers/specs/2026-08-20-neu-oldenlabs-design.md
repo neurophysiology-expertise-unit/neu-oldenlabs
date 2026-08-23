@@ -223,6 +223,67 @@ Report-only; QC never modifies inputs and never repairs values.
 - **Range sanity** — `%` measures within [0, 100], speeds ≥ 0, counts integral.
   Violations are reported per cage, never auto-corrected.
 
+### 5.1 Distance-resolution confound
+
+`distance_cm` is a **path length**, and path length is sampling-rate
+dependent — the coastline problem: summing six 10-minute path-length
+estimates captures micro-movement that a single 60-minute path-length
+estimate over the same span never sees, because the vendor computes each
+bin's path length **at that bin's own native resolution**. Downsampling
+afterwards (`metrics.resample_bins`, §6.0) cannot undo this — it can only
+average the already-inflated finer-resolution values down to a coarser
+cadence, not recover the coarser-resolution path length that would have been
+measured natively.
+
+Measured on the real study, across WILDTYPE animals only (so genotype cannot
+explain the gap) — cage 58616, natively at 600 s bins, against the other five
+cages, natively at 3600 s:
+
+| Measure | 58616 (600 s native) | Others (3600 s native) | Ratio |
+|---|---|---|---|
+| L5 (lowest 5-hour mean of hourly distance) | 1246 | 807 | 1.54× — zero overlap |
+| M10 (highest 10-hour mean) | 4205 | 4091 | 1.03× |
+| distance_cm_all | 3155 | 2850 | 1.11× |
+
+The inflation concentrates in the **nadir** (L5), not the peak (M10):
+quiet-hour movement is almost entirely micro-movement, which a finer native
+resolution captures far more of, while peak-hour movement is dominated by
+large translations that a coarser native resolution already captures well.
+
+**This is an expected result for a mixed-resolution study, not an error** —
+the run completes either way, and the confound is reported, never raised.
+`qc.distance_resolution_confound` detects it directly from
+`qc.bin_regularity` on the RAW (pre-resampling) frame — the native bin width
+per cage is observable before `metrics.resample_bins` ever runs — and names,
+as its own QC table (`qc_distance_resolution.csv`): which cages' native
+widths differ, what those widths are, and which profile measures the
+mismatch taints. The affected set (`io.DISTANCE_DERIVED_PROFILE_MEASURES`) is
+enumerated by hand from the code, not guessed by matching "distance" in a
+column name (that heuristic both over-matches, on `social_distance_cm_all`,
+a distinct raw measure never built from `distance_cm`, and under-matches, on
+`L5`/`M10`/`RA`/`mesor`/`amplitude`/`IS`/`IV`/`acrophase_hour`, none of which
+contain the substring "distance" yet are entirely built from it via
+`circadian.hourly_activity`, which reads only `distance_cm`):
+`distance_cm_all`/`_light`/`_dark`, `distance_dark_light_ratio`,
+`distance_cv_daily`, and the circadian family `L5`, `M10`, `RA`, `mesor`,
+`amplitude`, `IS`, `IV`, `acrophase_hour`.
+
+**Consequence for the statistics (§7):** the cage-stratified test is safe
+regardless — every cage's own bins share one native width, so a within-cage
+(mut − wt) difference is never a resolution artefact, and 58616 in
+particular is all-wildtype and carries weight zero in that test anyway. The
+**pooled** test (§7) and any cross-cage descriptive figure that mixes
+distance-derived values from cages of different native resolution are **not**
+safe. `groups.compare_pooled`/`scan_pooled` take this as a study-level
+boolean and set a `pooled_distance_bin_width_confound` column on the pooled
+comparison table, `True` only where the row's measure is distance-derived
+**and** a mismatch exists in this run — surfaced in
+`group_comparison_pooled.csv`, in the rendered pooled-comparison report
+tables, and in prose in both the Quality control section and the Secondary
+pooled-comparison section of `report.md`. The stratified table
+(`group_comparison.csv`) never carries this column — flagging it would be
+wrong, since it is unaffected by construction.
+
 ## 6. Metrics
 
 ### 6.0 Resampling to a common bin width

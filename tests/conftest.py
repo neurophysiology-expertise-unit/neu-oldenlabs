@@ -99,6 +99,55 @@ def synthetic_study(tmp_path, make_workbook):
 
 
 @pytest.fixture
+def mixed_resolution_study(tmp_path, make_workbook):
+    """Two genotype-mixed synthetic cages that differ in NATIVE bin width.
+
+    Mirrors `synthetic_study`'s shape (two loaded, genotype-mixed cages, one
+    missing) exactly except for bin width: cage 1001 is natively 600 s (like
+    the real study's cage 58616), cage 1002 is natively 3600 s (like the real
+    study's other five cages) -- so `qc.distance_resolution_confound` must
+    flag this study, and `synthetic_study` (uniform 600 s bins in both cages)
+    must not.
+    """
+    import json
+
+    from neu_oldenlabs.config import load_study
+
+    def varying(measure, tag, index):
+        if measure == "Cage in rack (1/0):":
+            return 1.0
+        return 1.0 + tag + (index % 7)
+
+    exports = {
+        1001: make_workbook(name="1001_x_cage.xlsx", tags=(1, 2, 3),
+                            bins=6 * 24 * 5, minutes=(10,), values=varying),
+        1002: make_workbook(name="1002_x_cage.xlsx", tags=(1, 2, 3),
+                            bins=24 * 5, minutes=(60,), values=varying),
+    }
+    animals = tmp_path / "animals.csv"
+    rows = ["cage #,animal #,,genotype,tag #,Tag date,Monitoring start"]
+    number = 1
+    for cage in (1001, 1002):
+        for tag, genotype in ((1, "W/w"), (2, "Mut/W"), (3, "Mut/W")):
+            prefix = str(cage) if tag == 1 else ""
+            rows.append(f"{prefix},{number},L,{genotype},{tag},,")
+            number += 1
+    animals.write_text("\n".join(rows) + "\n")
+
+    config = tmp_path / "study.json"
+    config.write_text(json.dumps({
+        "name": "mixed_resolution", "animals_csv": str(animals),
+        "cages": [{"cage": 1001, "export": str(exports[1001])},
+                  {"cage": 1002, "export": str(exports[1002])},
+                  {"cage": 1003, "export": None}],
+        "habituation_days": 0, "lights_on": 7, "lights_off": 19, "min_days": 1,
+        "primary_measures": ["distance_cm_all"],
+        "scan_measures": ["distance_cm_all", "IS", "inactive_pct_all"],
+    }))
+    return load_study(config)
+
+
+@pytest.fixture
 def all_wildtype_study(tmp_path, make_workbook):
     """One all-wildtype cage, mirroring the real study's current live shape.
 

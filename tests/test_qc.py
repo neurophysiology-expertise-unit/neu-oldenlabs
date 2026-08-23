@@ -5,9 +5,10 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-from neu_oldenlabs.io import load_cage
-from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage, excluded_tag_table,
-                              missing_values, non_finite_rack, qc_tables, range_violations,
+from neu_oldenlabs.io import DISTANCE_DERIVED_PROFILE_MEASURES, load_cage
+from neu_oldenlabs.qc import (apply_rack_mask, bin_regularity, coverage,
+                              distance_resolution_confound, excluded_tag_table, missing_values,
+                              native_bin_width, non_finite_rack, qc_tables, range_violations,
                               recording_breaks, rack_summary, valid_bins)
 
 
@@ -272,3 +273,65 @@ def test_excluded_tag_table_is_empty_when_nothing_is_excluded(make_workbook):
     table = excluded_tag_table(long, [])
     assert table.empty
     assert list(table.columns) == ["cage", "tag", "bins", "present_bins", "missing_fraction"]
+
+
+def _two_cage_long(make_workbook, minutes_a=(10,), minutes_b=(10,)):
+    fine = make_workbook(name="1001_x_cage.xlsx", tags=(1,), bins=6, minutes=minutes_a)
+    other = make_workbook(name="1002_x_cage.xlsx", tags=(1,), bins=6, minutes=minutes_b)
+    return pd.concat([load_cage(fine, 1001), load_cage(other, 1002)], ignore_index=True)
+
+
+def test_native_bin_width_reports_the_modal_duration_per_cage(make_workbook):
+    long = _two_cage_long(make_workbook, minutes_a=(10,), minutes_b=(60,))
+    widths = native_bin_width(long).set_index("cage")["native_bin_width_s"]
+    assert widths.loc[1001] == 600.0
+    assert widths.loc[1002] == 3600.0
+
+
+def test_distance_resolution_confound_flags_a_native_bin_width_mismatch(make_workbook):
+    # cage 1001 natively 600 s, cage 1002 natively 3600 s -- the real study's
+    # exact shape (58616 vs. the other five cages).
+    long = _two_cage_long(make_workbook, minutes_a=(10,), minutes_b=(60,))
+    table = distance_resolution_confound(long)
+
+    assert set(table["cage"]) == {1001, 1002}
+    assert table["bin_width_differs_in_study"].all()
+
+    affected = set(table["distance_derived_measures_affected"].iloc[0].split(", "))
+    assert affected == set(DISTANCE_DERIVED_PROFILE_MEASURES)
+    # Sanity on the enumeration itself: distance-derived measures include the
+    # raw phase-suffixed measure and the full circadian family, by name --
+    # not guessed by substring match (which would wrongly include
+    # `social_distance_cm_all` and miss `L5`/`IS`/`mesor`, none of which
+    # contain "distance").
+    assert "distance_cm_all" in affected and "L5" in affected and "IS" in affected
+    assert "mesor" in affected and "social_distance_cm_all" not in affected
+
+    # Every row repeats the same affected-measures string, so a reader
+    # scanning any row of the CSV sees the full picture.
+    assert table["distance_derived_measures_affected"].nunique() == 1
+
+
+def test_distance_resolution_confound_is_silent_when_native_widths_match(make_workbook):
+    long = _two_cage_long(make_workbook, minutes_a=(10,), minutes_b=(10,))
+    table = distance_resolution_confound(long)
+
+    assert not table["bin_width_differs_in_study"].any()
+    assert (table["distance_derived_measures_affected"] == "").all()
+
+
+def test_distance_resolution_confound_is_empty_on_an_empty_frame():
+    empty = pd.DataFrame(columns=["cage", "tag", "bin_start", "duration_s", "measure", "value"])
+    table = distance_resolution_confound(empty)
+    assert table.empty
+    assert list(table.columns) == [
+        "cage", "native_bin_width_s", "bin_width_differs_in_study",
+        "distance_derived_measures_affected",
+    ]
+
+
+def test_qc_tables_includes_the_distance_resolution_table(make_workbook):
+    long = _two_cage_long(make_workbook, minutes_a=(10,), minutes_b=(60,))
+    tables = qc_tables(long)
+    assert "distance_resolution" in tables
+    assert tables["distance_resolution"]["bin_width_differs_in_study"].all()

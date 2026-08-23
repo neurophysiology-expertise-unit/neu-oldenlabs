@@ -483,3 +483,72 @@ def test_scan_pooled_ranks_by_pooled_p_value_and_bh_corrects():
     assert list(table["pooled_p_value"]) == sorted(table["pooled_p_value"])
     assert "pooled_p_adjusted_bh" in table.columns
     assert len(table) == 2
+
+
+# ============================================================================
+# Distance-resolution confound flag on the pooled comparison
+# ============================================================================
+#
+# distance_cm is a path length, which is sampling-rate dependent (the
+# coastline problem, see qc.distance_resolution_confound); a POOLED
+# comparison of a distance-derived measure across cages of different NATIVE
+# bin width is not safe, and `pooled_distance_bin_width_confound` must mark
+# exactly those rows -- never the stratified table, which is unaffected by
+# construction.
+
+def test_compare_pooled_flags_a_distance_derived_measure_only_when_confound_is_true():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+
+    flagged = compare_pooled(profile, "distance_cm_all", bin_width_confound=True)
+    assert flagged["pooled_distance_bin_width_confound"] is True
+
+    not_confounded = compare_pooled(profile, "distance_cm_all", bin_width_confound=False)
+    assert not_confounded["pooled_distance_bin_width_confound"] is False
+
+
+def test_compare_pooled_never_flags_a_non_distance_measure_even_when_confound_is_true():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "speed_overall_cm_s_all"})
+    row = compare_pooled(profile, "speed_overall_cm_s_all", bin_width_confound=True)
+    assert row["pooled_distance_bin_width_confound"] is False
+
+
+def test_scan_pooled_flags_only_the_distance_derived_rows():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    profile["IS"] = profile["distance_cm_all"] + \
+        np.random.default_rng(11).normal(0, 5, len(profile))
+    profile["speed_overall_cm_s_all"] = profile["distance_cm_all"] + \
+        np.random.default_rng(12).normal(0, 5, len(profile))
+
+    table = scan_pooled(profile, ["distance_cm_all", "IS", "speed_overall_cm_s_all"],
+                        bin_width_confound=True)
+    flags = table.set_index("measure")["pooled_distance_bin_width_confound"]
+    assert bool(flags["distance_cm_all"]) is True
+    assert bool(flags["IS"]) is True
+    assert bool(flags["speed_overall_cm_s_all"]) is False
+
+
+def test_scan_pooled_flags_nothing_when_bin_widths_do_not_differ():
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+    profile["IS"] = profile["distance_cm_all"] + \
+        np.random.default_rng(11).normal(0, 5, len(profile))
+
+    table = scan_pooled(profile, ["distance_cm_all", "IS"], bin_width_confound=False)
+    assert not table["pooled_distance_bin_width_confound"].any()
+
+
+def test_stratified_compare_and_scan_never_carry_the_pooled_confound_column():
+    # The stratified table is unaffected by the resolution confound by
+    # construction (every cage's own bins share one native width), so it
+    # must never carry the pooled flag column at all -- not even set False.
+    values = study_values(effect=3.0, seed=5)
+    profile = values.rename(columns={"value": "distance_cm_all"})
+
+    row = compare(profile, "distance_cm_all")
+    assert "pooled_distance_bin_width_confound" not in row
+
+    table = scan(profile, ["distance_cm_all"])
+    assert "pooled_distance_bin_width_confound" not in table.columns

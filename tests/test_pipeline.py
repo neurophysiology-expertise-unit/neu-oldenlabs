@@ -270,3 +270,57 @@ def test_resample_bin_s_rebins_every_cage_before_metrics_are_computed(make_workb
     native = result["native_long"]
     assert set(native.loc[native["cage"] == 58616, "duration_s"]) == {600.0}
     assert set(native.loc[native["cage"] == 1002, "duration_s"]) == {3600.0}
+
+
+# ============================================================================
+# Distance-resolution confound, end to end
+# ============================================================================
+
+
+def test_mixed_native_bin_widths_are_reported_and_flag_pooled_distance_measures(
+        mixed_resolution_study, tmp_path):
+    output = tmp_path / "out"
+    result = run_study(mixed_resolution_study, output, cache_dir=None)
+
+    # 1) QC table names the mismatch, written as its own CSV.
+    resolution = result["qc"]["distance_resolution"]
+    assert set(resolution["cage"]) == {1001, 1002}
+    assert resolution["bin_width_differs_in_study"].all()
+    widths = resolution.set_index("cage")["native_bin_width_s"]
+    assert widths.loc[1001] == 600.0
+    assert widths.loc[1002] == 3600.0
+    assert (output / "qc_distance_resolution.csv").exists()
+
+    # 2) The pooled comparison carries the flag per row: True on the
+    #    distance-derived measures scanned (distance_cm_all, IS), False on
+    #    the non-distance one (inactive_pct_all).
+    pooled = result["scan_pooled"]
+    assert "pooled_distance_bin_width_confound" in pooled.columns
+    flags = pooled.set_index("measure")["pooled_distance_bin_width_confound"]
+    assert bool(flags.get("distance_cm_all", False)) is True
+    assert bool(flags.get("IS", False)) is True
+    assert bool(flags.get("inactive_pct_all", False)) is False
+
+    pooled_csv = pd.read_csv(output / "group_comparison_pooled.csv")
+    assert "pooled_distance_bin_width_confound" in pooled_csv.columns
+
+    # 3) The stratified table is never flagged -- it must not carry the
+    #    column at all, since it is unaffected by construction.
+    scan_table = result["scan"]
+    assert "pooled_distance_bin_width_confound" not in scan_table.columns
+    scan_csv = pd.read_csv(output / "group_comparison.csv")
+    assert "pooled_distance_bin_width_confound" not in scan_csv.columns
+
+
+def test_uniform_native_bin_widths_never_trigger_the_confound(synthetic_study, tmp_path):
+    output = tmp_path / "out"
+    result = run_study(synthetic_study, output, cache_dir=None)
+
+    resolution = result["qc"]["distance_resolution"]
+    assert not resolution.empty
+    assert not resolution["bin_width_differs_in_study"].any()
+    assert (resolution["distance_derived_measures_affected"] == "").all()
+
+    pooled = result["scan_pooled"]
+    if "pooled_distance_bin_width_confound" in pooled.columns:
+        assert not pooled["pooled_distance_bin_width_confound"].any()
