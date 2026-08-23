@@ -22,6 +22,23 @@ def test_report_names_missing_cages_and_the_permutation_count(synthetic_study, t
     assert "min_attainable_p" in text or "smallest attainable" in text.lower()
 
 
+def test_report_carries_a_published_measure_glossary(synthetic_study, tmp_path):
+    # Every measure column actually reported in the profile table earns a
+    # published-source definition in the Methods section, citing delali2025 --
+    # not the vendor's export header, which is wrong for two of them.
+    text = build_study_report(synthetic_study, tmp_path / "out").read_text()
+    assert "delali2025" in text
+    assert "doi:10.3389/fnbeh.2025.1696654" in text
+    assert "distance_cm" in text
+    # The two unit-error measures' corrected units appear, not the vendor's.
+    assert "cm/s^2" in text or "cm/s²" in text
+    assert "deg/s" in text
+    # Interpretation-critical qualifiers from the paper survive into the report.
+    assert "engagement" in text.lower() and "intake" in text.lower()
+    assert "top 1%" in text.lower()
+    assert "sleep proxy" in text.lower() or "sleep, i.e." in text.lower()
+
+
 def test_report_describes_the_cluster_permutation_test(synthetic_study, tmp_path):
     text = build_study_report(synthetic_study, tmp_path / "out").read_text()
     lower = text.lower()

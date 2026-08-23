@@ -13,6 +13,25 @@ by a minute here and there (see `qc.bin_regularity` and `qc.recording_breaks`).
 Measure names are mapped through an explicit dictionary. An unrecognised name
 raises: a vendor software update that renames a column must surface as a crash,
 not as a quietly shorter table.
+
+Measure SEMANTICS -- what each exported column actually means -- come from the
+instrument paper: Delalic, Florea et al. (2025), "Smart Lids for deep
+multi-animal phenotyping in standard home cages", Front. Behav. Neurosci.,
+doi:10.3389/fnbeh.2025.1696654 (citekey `delali2025`). See `MEASURE_DEFINITIONS`
+below for the published definition of each measure. Before this paper was
+available, this repository had no independent source for what a measure meant
+and simply carried the vendor's column header forward; per AGENTS.md, vendor
+semantics are preserved, never reinterpreted -- now that a published source
+exists, the documentation is corrected to match it.
+
+Two of the vendor's own export column headers understate their units: both
+`accel_cm_s` ("Average movement acceleration (cm/s):") and
+`angular_velocity_cm_s` ("Average movement angular velocity (cm/s):") are
+labelled "(cm/s)" in the export, but the paper gives acceleration in cm/s^2 and
+angular velocity in deg/s. The slugs are NOT renamed here -- they mirror the
+vendor's own export columns by design, and renaming them would break that
+correspondence -- only the units stated in documentation (this module,
+`MEASURE_DEFINITIONS`, the design spec, and the report) are corrected.
 """
 from __future__ import annotations
 
@@ -75,6 +94,120 @@ MEASURE_KIND = {
 }
 
 PERCENT_MEASURES = tuple(slug for slug in MEASURE_KIND if slug.endswith("_pct"))
+
+# The published definition of each exported measure, from the instrument paper:
+# Delalic, Florea et al. (2025), "Smart Lids for deep multi-animal phenotyping in
+# standard home cages", Front. Behav. Neurosci., doi:10.3389/fnbeh.2025.1696654
+# (citekey `delali2025`). Keyed by slug, one entry per `MEASURES` value, plus
+# `in_rack`, which is not one of the paper's 21 behavioural measures -- it is the
+# rack-presence mask this pipeline uses to exclude bins, and its definition below
+# says so rather than inventing a paper source for it. `test_io.py` asserts this
+# dict, `MEASURES`, and `MEASURE_KIND` cannot drift apart (same key set).
+MEASURE_DEFINITIONS: dict[str, str] = {
+    "accel_cm_s": (
+        "Acceleration (cm/s^2): average linear acceleration while the animal is "
+        "moving; excludes quiescent/sleep periods. The vendor's own export column "
+        "header says \"(cm/s)\" -- that is a labelling error in the export, not "
+        "the paper's unit; the true unit is cm/s^2."
+    ),
+    "angular_velocity_cm_s": (
+        "Angular motion (deg/s): average movement angular velocity while moving. "
+        "The vendor's own export column header says \"(cm/s)\" -- that is a "
+        "labelling error in the export, not the paper's unit; the true unit is "
+        "deg/s."
+    ),
+    "speed_overall_cm_s": (
+        "Average movement speed (cm/s): mean linear speed over the time bin, "
+        "including inactivity."
+    ),
+    "speed_awake_cm_s": (
+        "Average awake movement speed (cm/s): mean linear speed over the time "
+        "bin, excluding inactivity."
+    ),
+    "speed_max_cm_s": (
+        "Max movement speed (cm/s): the mean of the top 1% of frame-wise "
+        "movement speeds during active periods, not a raw single-frame maximum -- "
+        "this reduces noise from single-frame spikes and makes the measure "
+        "outlier-robust by construction."
+    ),
+    "distance_cm": (
+        "Distance traveled (cm): total travel path length over the observation "
+        "period."
+    ),
+    "aggression_events": (
+        "Aggression events (count): individual bouts of chasing, mounting, "
+        "fighting, or a combination, involving two or more animals; bouts last "
+        "20 s to 5 min and the whole bout counts as one event."
+    ),
+    "aggression_time_pct": (
+        "Aggression time (%): percentage of time engaged in aggression."
+    ),
+    "social_distance_cm": (
+        "Social distance (cm): average distance of the mouse's centroid to the "
+        "nearest mouse's centroid. Does not consider directionality -- a low "
+        "value does not imply interaction; its purpose is to identify social "
+        "distancing or withdrawal."
+    ),
+    "occupancy_center_pct": (
+        "Cage center time (%): time in the centre zone, defined as >=2 cm from "
+        "all cage walls."
+    ),
+    "occupancy_front_half_pct": (
+        "Cage front time (%): time in the front half of the cage."
+    ),
+    "occupancy_corners_pct": (
+        "Cage corner time (%): time in the approximately 9 cm^2 area of each of "
+        "the 4 cage corners."
+    ),
+    "enrichment_tube_pct": (
+        "Enrichment tube interaction time (%): time on, in, or immediately "
+        "around the enrichment tube."
+    ),
+    "time_climbing_pct": (
+        "Climb time (%): time climbing on the food hopper metal grid, defined as "
+        "both feet off the floor and reaching the upper portion of the hopper."
+    ),
+    "climbing_events": (
+        "Climbing events (count): discrete climbing bouts on the food hopper "
+        "metal grid, as defined for climb time."
+    ),
+    "rearing_events": (
+        "Rearing events (count): rears against one of the three side walls; "
+        "excludes rears against the food hopper, the red (enrichment) tube, and "
+        "rears in the cage centre. The authors note that centre rears and hopper "
+        "rears were not separately annotated or detected."
+    ),
+    "time_rearing_pct": (
+        "Time spent rearing (%): percentage of time rearing against one of the "
+        "three side walls, under the same exclusions as rearing events (excludes "
+        "the food hopper, the red tube, and the cage centre)."
+    ),
+    "time_drinking_pct": (
+        "Drinking time (%): time interacting with the bottle nozzle or "
+        "autowater spout. The authors state this reflects behavioural "
+        "engagement, not actual intake."
+    ),
+    "time_eating_pct": (
+        "Eating time (%): time interacting with food at the hopper, including "
+        "\"grinding\" (chewing without ingestion). The authors state this "
+        "reflects behavioural engagement, not actual intake."
+    ),
+    "sleep_bouts": (
+        "Sleep bouts (count): discrete inactivity bouts lasting >=2 minutes; the "
+        "2-minute threshold follows Pack et al. (2007)."
+    ),
+    "inactive_pct": (
+        "Sleep time (%): percentage of recording time classified as sleep, i.e. "
+        "continuous inactivity lasting >=2 minutes -- a sleep proxy with that "
+        "threshold, not a measure of generic immobility."
+    ),
+    "in_rack": (
+        "Cage in rack (1/0): NOT one of the paper's 21 behavioural measures -- "
+        "this is the rack-presence mask (Cage in rack == 0 marks a bin the cage "
+        "was pulled from the rack, e.g. for husbandry) that this pipeline uses to "
+        "exclude bins from every metric before aggregation."
+    ),
+}
 
 COLUMNS = ["cage", "tag", "bin_start", "bin_end", "duration_s", "measure", "value"]
 

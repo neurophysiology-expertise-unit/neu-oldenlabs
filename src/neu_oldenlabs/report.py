@@ -18,9 +18,15 @@ import pandas as pd
 
 from . import groups, qc
 from .config import StudyConfig
-from .io import MEASURE_KIND
+from .io import MEASURE_DEFINITIONS, MEASURE_KIND
 from .pipeline import _base_measure, run_study
 from .profile import IDENTITY
+
+_DELALIC_CITATION = (
+    "Delalic, Florea et al. (2025), \"Smart Lids for deep multi-animal "
+    "phenotyping in standard home cages\", Front. Behav. Neurosci., "
+    "doi:10.3389/fnbeh.2025.1696654"
+)
 
 # Figure filenames, in the order `pipeline.run_study` writes them, with the
 # caption each earns per the design spec's figure list (section 8).
@@ -334,6 +340,43 @@ def _count_kind_sentence(per_hour: list[str]) -> str:
     return base
 
 
+def _measure_glossary(reported_measures: list[str]) -> str:
+    """Published definition of every raw exported measure actually reported.
+
+    `reported_measures` is the profile table's own columns (see `_methods`),
+    stripped of phase suffix via `_base_measure` -- the same set the per-hour
+    disclosure above (`_count_kind_sentence`) is built from -- so this glossary
+    lists exactly the measures this run's report carries, never the full
+    22-measure catalogue regardless of what was actually analysed. Derived
+    circadian statistics (`IS`, `IV`, `RA`, `acrophase_hour`, ...) are not raw
+    exported measures and have no entry in `io.MEASURE_DEFINITIONS`, so they
+    are silently skipped here rather than raising.
+
+    Definitions come from the instrument paper -- `delali2025` -- via
+    `io.MEASURE_DEFINITIONS`, kept in sync with `io.MEASURES`/`io.MEASURE_KIND`
+    by `test_io.py` so this table cannot silently drop a measure the pipeline
+    still produces.
+    """
+    bases = sorted({_base_measure(m) for m in reported_measures})
+    known = [b for b in bases if b in MEASURE_DEFINITIONS]
+    if not known:
+        return ""
+    rows = pd.DataFrame({"measure": known,
+                         "definition": [MEASURE_DEFINITIONS[b] for b in known]})
+    lines = [
+        "**Measure definitions (published source).** Every measure reported "
+        f"below is defined per the instrument paper, {_DELALIC_CITATION} "
+        "(citekey `delali2025`) -- not reinterpreted from the vendor's export "
+        "column header, which for two measures (`accel_cm_s`, "
+        "`angular_velocity_cm_s`) understates its own unit; see the note in "
+        "those two rows.",
+        "",
+        _markdown_table(rows, ["measure", "definition"]),
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _bin_timing_sentence(result: dict) -> str:
     """Describe observed bin span and start-to-start cadence, read off the data.
 
@@ -497,11 +540,19 @@ def _methods(study: StudyConfig, result: dict) -> str:
         f"**Aggregation.** {_bin_timing_sentence(result)} Maxima take the maximum. "
         "Counts (see below) become a rate per valid hour, so a day that lost bins to "
         "the rack mask is not scored as a day of low activity. Bins where "
-        "`Cage in rack == 0` are excluded from every metric before aggregation.",
+        "`Cage in rack == 0` are excluded from every metric before aggregation. Note "
+        "that `speed_max_cm_s` is already outlier-robust at the per-BIN level -- per "
+        "the instrument paper (`delali2025`), each bin's own value is the mean of the "
+        "top 1% of frame-wise speeds during active periods within that bin, not a "
+        "single-frame maximum -- so \"maxima take the maximum\" describes only this "
+        "pipeline's further aggregation of that already-robust per-bin value across "
+        "bins, never a raw single-frame peak.",
         "",
         _resampling_sentence(result),
         "",
         per_hour_line,
+        "",
+        _measure_glossary(reported_measures),
         "",
         f"**Phase definition.** Light phase is `hour in [{study.lights_on}, "
         f"{study.lights_off})`; every other hour is dark phase (a "

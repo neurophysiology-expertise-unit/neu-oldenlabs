@@ -45,34 +45,58 @@ Bins are *nominally* 10 minutes but jitter: 5681 gaps of 10 min, 36 of 11 min,
 
 The 22 measures:
 
-| Slug | Source name | Type |
-|---|---|---|
-| `aggression_time_pct` | Aggression time (%) | rate |
-| `aggression_events` | Number of agression events (1/0) | count |
-| `accel_cm_s` | Average movement acceleration (cm/s) | mean |
-| `angular_velocity_cm_s` | Average movement angular velocity (cm/s) | mean |
-| `speed_overall_cm_s` | Average overall speed (cm/s) | mean |
-| `speed_awake_cm_s` | Average speed when awake (cm/s) | mean |
-| `speed_max_cm_s` | Max movement speed (cm/s) | max |
-| `distance_cm` | Total distance traveled (cm) | count/sum |
-| `occupancy_center_pct` | Cage center occupancy (%) | rate |
-| `occupancy_front_half_pct` | Cage front half occupancy (%) | rate |
-| `occupancy_corners_pct` | Time spent in cage corners (%) | rate |
-| `in_rack` | Cage in rack (1/0) | mask |
-| `climbing_events` | Climbing events | count |
-| `time_climbing_pct` | Time spent climbing (%) | rate |
-| `rearing_events` | Rearing events | count |
-| `time_rearing_pct` | Time spent rearing (%) | rate |
-| `enrichment_tube_pct` | Enrichment tube interaction time (%) | rate |
-| `sleep_bouts` | Sleep bouts | count |
-| `inactive_pct` | Sleep time - spent inactive (%) | rate |
-| `social_distance_cm` | Social Distance (cm) | mean |
-| `time_eating_pct` | Time spent eating (%) | rate |
-| `time_drinking_pct` | Time spent drinking water (%) | rate |
+| Slug | Source name | Type | Published unit |
+|---|---|---|---|
+| `aggression_time_pct` | Aggression time (%) | rate | % |
+| `aggression_events` | Number of agression events (1/0) | count | count |
+| `accel_cm_s` | Average movement acceleration (cm/s) | mean | **cm/s²** |
+| `angular_velocity_cm_s` | Average movement angular velocity (cm/s) | mean | **deg/s** |
+| `speed_overall_cm_s` | Average overall speed (cm/s) | mean | cm/s |
+| `speed_awake_cm_s` | Average speed when awake (cm/s) | mean | cm/s |
+| `speed_max_cm_s` | Max movement speed (cm/s) | max | cm/s |
+| `distance_cm` | Total distance traveled (cm) | count/sum | cm |
+| `occupancy_center_pct` | Cage center occupancy (%) | rate | % |
+| `occupancy_front_half_pct` | Cage front half occupancy (%) | rate | % |
+| `occupancy_corners_pct` | Time spent in cage corners (%) | rate | % |
+| `in_rack` | Cage in rack (1/0) | mask | mask |
+| `climbing_events` | Climbing events | count | count |
+| `time_climbing_pct` | Time spent climbing (%) | rate | % |
+| `rearing_events` | Rearing events | count | count |
+| `time_rearing_pct` | Time spent rearing (%) | rate | % |
+| `enrichment_tube_pct` | Enrichment tube interaction time (%) | rate | % |
+| `sleep_bouts` | Sleep bouts | count | count |
+| `inactive_pct` | Sleep time - spent inactive (%) | rate | % |
+| `social_distance_cm` | Social Distance (cm) | mean | cm |
+| `time_eating_pct` | Time spent eating (%) | rate | % |
+| `time_drinking_pct` | Time spent drinking water (%) | rate | % |
+
+`accel_cm_s` and `angular_velocity_cm_s` are the two corrected rows: the "Source
+name" column is the vendor's own export column header, verbatim, and that header
+is wrong for these two -- it says "(cm/s)" for both. The "Published unit" column
+is what the instrument paper actually gives (see §2.1.1 below): cm/s² for
+acceleration, deg/s for angular velocity. The slugs are unchanged -- they mirror
+the vendor's export columns by design -- only the documented unit is corrected.
 
 The mapping lives in one explicit dict. **An unrecognised measure name is a hard
 error**, never a silent drop — a vendor software update that renames or adds a
 column must surface as a crash, not as a quietly shorter table.
+
+### 2.1.1 Measure semantics: the published instrument paper
+
+Until 2026-08-23 this repository had no independent source for what an exported
+measure actually *means* — only the vendor's own export column header, taken as
+given. That source now exists: Delalic, Florea et al. (2025), "Smart Lids for
+deep multi-animal phenotyping in standard home cages", Front. Behav. Neurosci.,
+doi:10.3389/fnbeh.2025.1696654 (citekey `delali2025`), is the instrument paper
+for the Olden Labs DOME Smart Lid and the MOT pipeline that produced these
+exports. Per AGENTS.md, this paper is now the authority for each measure's
+definition — not the vendor's column header, which the two unit corrections
+above show can itself be wrong. The published definition of every measure
+(including `in_rack`, which the paper does not cover — it is this pipeline's
+rack-presence mask) lives in `io.MEASURE_DEFINITIONS`, one entry per slug, kept
+in sync with `MEASURES`/`MEASURE_KIND` by `test_io.py`, and is reproduced in the
+rendered report's Methods section for every measure that report actually
+carries.
 
 ### 2.2 Animal table (`DaCruz_Epilepsy.csv`)
 
@@ -393,7 +417,9 @@ Test-driven, with synthetic fixtures only — never a slice of real animal data.
 - Never commit Oldenlabs exports, the animal/genotype CSV, ear-tag identities, or
   generated animal-level tables. Data are supplied by path at runtime.
 - Preserve Oldenlabs source semantics. Do not silently reinterpret or rename
-  exported measures; an unknown measure name is an error.
+  exported measures; an unknown measure name is an error. The authority for what
+  each measure means is the instrument paper, `delali2025` (§2.1.1), not the
+  vendor's export column header.
 - Every plotted quantity must also be written as a machine-readable table.
 - Analysis runs record input hashes and parameters in `provenance.json`.
 - Never report a genotype comparison computed from cages whose exports are

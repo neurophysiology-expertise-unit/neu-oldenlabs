@@ -5,8 +5,8 @@ import pytest
 from openpyxl import load_workbook
 
 from neu_oldenlabs import __version__
-from neu_oldenlabs.io import (MEASURE_KIND, MEASURES, cage_id_from_filename, load_cage,
-                              load_cage_cached)
+from neu_oldenlabs.io import (MEASURE_DEFINITIONS, MEASURE_KIND, MEASURES,
+                              cage_id_from_filename, load_cage, load_cage_cached)
 
 
 def test_measure_map_has_the_twenty_two_exported_measures():
@@ -18,6 +18,23 @@ def test_measure_map_has_the_twenty_two_exported_measures():
     assert MEASURE_KIND["in_rack"] == "mask"
     # The exporter's spelling of "agression" is preserved, not corrected.
     assert "Number of agression events (1/0):" in MEASURES
+
+
+def test_every_measure_has_a_published_definition_and_vice_versa():
+    # MEASURES, MEASURE_KIND, and MEASURE_DEFINITIONS must share exactly the
+    # same slug set -- three dicts describing the same 22 measures cannot be
+    # allowed to drift apart (e.g. a new measure added to one and forgotten in
+    # another). MEASURE_DEFINITIONS holds the published definition from the
+    # instrument paper (Delalic, Florea et al. 2025, delali2025), or, for
+    # `in_rack`, an explicit note that it is not one of the paper's measures.
+    slugs = set(MEASURES.values())
+    assert set(MEASURE_KIND) == slugs
+    assert set(MEASURE_DEFINITIONS) == slugs
+    for slug, definition in MEASURE_DEFINITIONS.items():
+        assert isinstance(definition, str) and definition.strip(), slug
+    # The two unit-error slugs must document the vendor header's own mistake.
+    assert "cm/s^2" in MEASURE_DEFINITIONS["accel_cm_s"]
+    assert "deg/s" in MEASURE_DEFINITIONS["angular_velocity_cm_s"]
 
 
 def test_load_cage_returns_tidy_long_rows(make_workbook):
